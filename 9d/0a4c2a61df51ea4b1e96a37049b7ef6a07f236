@@ -1,0 +1,21 @@
+packages/adapters/src/cluster/k3s-host.ts
+  s_3f22cf700e16c8::t_08a89330656e05 194-197
+packages/adapters/src/cluster/k3s.test.ts
+  s_3f22cf700e16c8::t_6712d39e269a81 174-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9d0a4c2a61df51ea4b1e96a37049b7ef6a07f236",
+  "prompts": {},
+  "sessions": {
+    "s_3f22cf700e16c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "431a1267-90d9-42cb-a8aa-b4b7fd17588c",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
