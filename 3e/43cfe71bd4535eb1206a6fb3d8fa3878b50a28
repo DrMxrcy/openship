@@ -1,0 +1,24 @@
+apps/api/test/modules/system/cluster-runtime.test.ts
+  s_3f22cf700e16c8::t_9cc18e67236e84 206-238
+packages/platform/src/engine/modules/system/cluster-runtime.operations.ts
+  s_3f22cf700e16c8::t_f5404dd19c17aa 584-585,587-588
+  s_3f22cf700e16c8::t_0264c0273b3c3f 586,589-590
+docs/k3s-cluster-runtime.md
+  s_3f22cf700e16c8::t_d6bde652eab397 80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3e43cfe71bd4535eb1206a6fb3d8fa3878b50a28",
+  "prompts": {},
+  "sessions": {
+    "s_3f22cf700e16c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "431a1267-90d9-42cb-a8aa-b4b7fd17588c",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
