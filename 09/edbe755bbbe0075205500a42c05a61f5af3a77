@@ -1,0 +1,31 @@
+packages/platform/src/engine/modules/deployments/build-pipeline.ts
+  s_3f22cf700e16c8::t_465248f32f6e09 1292-1295
+  s_3f22cf700e16c8::t_19f23c43d3a60b 155
+apps/api/src/modules/deployments/compose/force-pull.test.ts
+  s_3f22cf700e16c8::t_a2f90b1646f2f3 50-67
+packages/platform/src/engine/modules/deployments/compose/deploy.service.ts
+  s_3f22cf700e16c8::t_2a1669dd44570f 715-719
+  s_3f22cf700e16c8::t_71d5170199483e 1451-1453
+  s_3f22cf700e16c8::t_4458220f86ac24 1359,1371
+  s_3f22cf700e16c8::t_2965b6b74e998a 612
+  s_3f22cf700e16c8::t_522164954ea994 613
+  s_3f22cf700e16c8::t_b6cfafd8805fe6 14
+packages/platform/src/engine/modules/deployments/image-pull-policy.ts
+  s_3f22cf700e16c8::t_8fa5fbfcf2c8a9 1-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "09edbe755bbbe0075205500a42c05a61f5af3a77",
+  "prompts": {},
+  "sessions": {
+    "s_3f22cf700e16c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "431a1267-90d9-42cb-a8aa-b4b7fd17588c",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
