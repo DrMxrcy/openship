@@ -1,0 +1,33 @@
+apps/api/test/modules/projects/project-build-resources.test.ts
+  s_8ab44c54be3200::t_3d7aa3920b947b 49-82
+apps/api/test/modules/projects/project-cluster.test.ts
+  s_8ab44c54be3200::t_d85276ff212d60 101,119-150
+apps/web/content/docs/guides/mcp-clusters-and-scaling.mdx
+  s_8ab44c54be3200::t_becc8d3f04e19e 146-166
+packages/adapters/src/runtime/kubernetes.test.ts
+  s_8ab44c54be3200::t_736507c62193b9 579-594,635-636
+packages/adapters/src/runtime/kubernetes.ts
+  s_8ab44c54be3200::t_cce8ea34154c79 13,341,345-346,377-378,495-498
+packages/core/src/cluster-workload.ts
+  s_8ab44c54be3200::t_4af7b5a9efd0ad 100-105,123-138
+packages/platform/src/engine/modules/projects/project-cluster.operations.ts
+  s_8ab44c54be3200::t_60c74b136f6ef3 4,16,114-117
+packages/platform/src/engine/modules/projects/project-resources.service.ts
+  s_8ab44c54be3200::t_6c742fcd8533af 11,123-126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d42520372cce375dea4d3978098f0cbb2111a30e",
+  "prompts": {},
+  "sessions": {
+    "s_8ab44c54be3200": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1dbbfaf2-a43c-4211-af85-65f6cce5d7cc",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
