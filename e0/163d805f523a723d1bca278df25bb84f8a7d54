@@ -1,0 +1,35 @@
+apps/api/src/modules/projects/project.routes.ts
+  s_8ab44c54be3200::t_8ac8e3aa62792f 1032
+apps/api/test/modules/deployments/build.service.test.ts
+  s_8ab44c54be3200::t_038569dd481664 574-585
+apps/api/test/modules/projects/project-cluster.test.ts
+  s_8ab44c54be3200::t_75de76773b0bb6 97-129
+apps/web/content/docs/api/mcp-tools.mdx
+  s_8ab44c54be3200::t_eca00ddec320fc 426
+packages/adapters/src/runtime/kubernetes.test.ts
+  s_8ab44c54be3200::t_19fb7ff7ebec15 10,113-117,124,397-626
+packages/adapters/src/runtime/kubernetes.ts
+  s_8ab44c54be3200::t_62443bf4136b63 371-437,443,467,469,497,503-506,509-511
+packages/contracts/src/project-cluster.ts
+  s_8ab44c54be3200::t_21bfeeb9408be3 21-74
+packages/contracts/test/project-inputs.test.ts
+  s_8ab44c54be3200::t_9a6fac1b4c1be6 2,32-73
+packages/core/src/cluster-workload.ts
+  s_8ab44c54be3200::t_9efc5ad196dd36 25-40,62-116,119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e0163d805f523a723d1bca278df25bb84f8a7d54",
+  "prompts": {},
+  "sessions": {
+    "s_8ab44c54be3200": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1dbbfaf2-a43c-4211-af85-65f6cce5d7cc",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
