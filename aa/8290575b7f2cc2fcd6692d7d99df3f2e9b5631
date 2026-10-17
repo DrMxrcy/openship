@@ -1,0 +1,64 @@
+packages/core/src/access-capabilities.ts
+  s_4792c0a8c09b36::t_e99bf6507a8ff6 1-94
+  s_4792c0a8c09b36::t_3c49656958646b 95-101
+apps/api/src/lib/route-permission.ts
+  s_4792c0a8c09b36::t_f3502b338538c4 28,499-504,599,601-602,627,631-633
+apps/api/src/modules/domains/domain.controller.ts
+  s_4792c0a8c09b36::t_0b0dfb3b743806 20,29
+apps/api/src/modules/mcp/mcp-tools.ts
+  s_4792c0a8c09b36::t_6baac11c0eab51 17,94-97,401-404
+apps/api/src/modules/mcp/mcp.routes.ts
+  s_4792c0a8c09b36::t_0243ae44cddbfc 11,77-78,83-88,125
+apps/api/test/lib/permission-nested-list-parent.test.ts
+  s_4792c0a8c09b36::t_c71cf757c293a3 71,76-80,82,90
+apps/api/test/modules/mcp/mcp-tools-filter.test.ts
+  s_4792c0a8c09b36::t_4865d4a06307d9 134,308-325,327
+apps/api/test/modules/tokens/mint-capabilities.test.ts
+  s_4792c0a8c09b36::t_92d70d15763c8a 1-228
+apps/cli/src/commands/token.ts
+  s_4792c0a8c09b36::t_ef72f112184a36 14,28-36,40,80
+apps/cli/test/unit/token-grant.test.ts
+  s_4792c0a8c09b36::t_29b72a5355fb0b 1-23
+packages/contracts/src/token-inputs.ts
+  s_4792c0a8c09b36::t_3b8012254f5db6 2,22-23,29
+packages/core/src/access-grants.ts
+  s_4792c0a8c09b36::t_85c04cd6028bb7 36-37,45-51
+packages/core/src/index.ts
+  s_4792c0a8c09b36::t_1e42229dc2d9a2 87
+packages/db/src/repos/personal-access-token-grant.repo.ts
+  s_4792c0a8c09b36::t_96cf8e93fb48b1 14-15,21,28,42,47-48
+packages/db/src/repos/personal-access-token.repo.ts
+  s_4792c0a8c09b36::t_924fbeec54639e 5,183
+packages/db/src/repos/resource-grant.repo.ts
+  s_4792c0a8c09b36::t_e3106491bfadaf 14,34-35
+packages/platform/src/authorization.ts
+  s_4792c0a8c09b36::t_051893cebd25bf 9-11,41-46,55,126,150-160,278,290
+packages/platform/src/builds.ts
+  s_4792c0a8c09b36::t_bb6cb566802dc3 42
+packages/platform/src/deployments.ts
+  s_4792c0a8c09b36::t_da0ea0a84ac093 82
+packages/platform/src/domains.ts
+  s_4792c0a8c09b36::t_d971fe201976e3 5,30-36,38
+packages/platform/src/engine/modules/permissions/permissions.service.ts
+  s_4792c0a8c09b36::t_26632deb2b3a21 537
+packages/platform/src/engine/modules/tokens/token.service.ts
+  s_4792c0a8c09b36::t_12220f81d02656 8-10,14-15,63,95,97-107,245,268-278,534
+packages/platform/test/grant-capabilities.test.ts
+  s_4792c0a8c09b36::t_f2cdba23cc280f 1-235
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aa8290575b7f2cc2fcd6692d7d99df3f2e9b5631",
+  "prompts": {},
+  "sessions": {
+    "s_4792c0a8c09b36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e6ec4cec-2d53-4609-b9ea-53e010c0822e",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
