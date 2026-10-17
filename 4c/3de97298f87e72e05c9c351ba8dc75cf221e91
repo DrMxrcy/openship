@@ -1,0 +1,27 @@
+apps/web/content/docs/api/deployments.mdx
+  s_4792c0a8c09b36::t_8af689e70343bd 335-341
+apps/web/content/docs/api/domains.mdx
+  s_4792c0a8c09b36::t_4168cd867168ca 141-147
+apps/web/content/docs/cli/access.mdx
+  s_4792c0a8c09b36::t_5c9ca9cd1e6fd1 131,136-137
+apps/web/content/docs/cli/reference/token/index.mdx
+  s_4792c0a8c09b36::t_21a5ca6a2ef9f2 40
+apps/web/content/docs/security/permissions.mdx
+  s_4792c0a8c09b36::t_90e5f112083089 94-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4c3de97298f87e72e05c9c351ba8dc75cf221e91",
+  "prompts": {},
+  "sessions": {
+    "s_4792c0a8c09b36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e6ec4cec-2d53-4609-b9ea-53e010c0822e",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
