@@ -1,0 +1,57 @@
+apps/dashboard/src/app/(dashboard)/settings/_components/AccessEditorModal.tsx
+  s_4792c0a8c09b36::t_d69c2a56a675e1 62-67
+apps/dashboard/src/app/(dashboard)/settings/_components/TeamTab.tsx
+  s_4792c0a8c09b36::t_451d650d1a2d6e 350
+apps/dashboard/src/components/permissions/AccessControlEditor.tsx
+  s_4792c0a8c09b36::t_9140c9227c8747 64-65,67-72,128
+apps/dashboard/src/components/permissions/AccessScopeEditor.tsx
+  s_4792c0a8c09b36::t_d0a39c55766b2f 42,56-57,151
+apps/dashboard/src/components/permissions/AccessScopeSummary.tsx
+  s_4792c0a8c09b36::t_67c98a5639fa86 35,273,333-341
+apps/dashboard/src/components/permissions/ResourcePicker.tsx
+  s_4792c0a8c09b36::t_9dd7e9732994a8 13-15,41-44,46-47,56-59,156-160,179,248-249,258,260-267,391,457,475-476,500,513-514,560,567-637,642-646
+apps/dashboard/src/components/permissions/capability-rows.render.test.tsx
+  s_4792c0a8c09b36::t_a4adc612f6bd6b 1-56
+apps/dashboard/src/components/permissions/mcp-access-templates.test.ts
+  s_4792c0a8c09b36::t_f9ee92ca90db44 674-694
+apps/dashboard/src/components/permissions/mcp-access-templates.ts
+  s_4792c0a8c09b36::t_0934168c754057 53,55,57,123-128,441,501,532,549-552,578-581,637
+apps/dashboard/src/i18n/locales/ar/widgets.json
+  s_4792c0a8c09b36::t_e8275a075993c8 288-307
+apps/dashboard/src/i18n/locales/de/widgets.json
+  s_4792c0a8c09b36::t_d449ee529d52ea 288-307
+apps/dashboard/src/i18n/locales/en/widgets.json
+  s_4792c0a8c09b36::t_2e9685d262446b 288-307
+apps/dashboard/src/i18n/locales/es/widgets.json
+  s_4792c0a8c09b36::t_bcb1ab9aa62b88 288-307
+apps/dashboard/src/i18n/locales/fr/widgets.json
+  s_4792c0a8c09b36::t_7609ac3c771281 288-307
+apps/dashboard/src/i18n/locales/ja/widgets.json
+  s_4792c0a8c09b36::t_bad1abb0465fcb 288-307
+apps/dashboard/src/i18n/locales/pt/widgets.json
+  s_4792c0a8c09b36::t_bcb6c3be74b3a6 288-307
+apps/dashboard/src/i18n/locales/ru/widgets.json
+  s_4792c0a8c09b36::t_eec22954a02707 288-307
+apps/dashboard/src/i18n/locales/tr/widgets.json
+  s_4792c0a8c09b36::t_2ed84a7073557a 288-307
+apps/dashboard/src/i18n/locales/zh/widgets.json
+  s_4792c0a8c09b36::t_a63c25d153c132 288-307
+apps/dashboard/src/lib/api/permissions.ts
+  s_4792c0a8c09b36::t_a26ef3b6e3b5f3 7,29-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5b8553525d29fec35f0c73d37561d64b346e1604",
+  "prompts": {},
+  "sessions": {
+    "s_4792c0a8c09b36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e6ec4cec-2d53-4609-b9ea-53e010c0822e",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
