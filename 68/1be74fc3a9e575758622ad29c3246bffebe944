@@ -1,0 +1,47 @@
+apps/api/src/modules/domains/domain.controller.ts
+  s_4792c0a8c09b36::t_eebbc6307ec8f8 4,39-41
+apps/api/src/modules/domains/domain.routes.ts
+  s_4792c0a8c09b36::t_866ad760798b2d 15,49
+apps/api/test/modules/domains/domain-service-binding.integration.test.ts
+  s_4792c0a8c09b36::t_c49f7675f36b25 1-261
+packages/contracts/src/domain-inputs.ts
+  s_4792c0a8c09b36::t_001ddae48873ee 21-32,66,69-85,116
+packages/contracts/src/domains.ts
+  s_4792c0a8c09b36::t_aedec238c36559 2,48-50,165
+packages/db/drizzle/0199_domain_service_binding.sql
+  s_4792c0a8c09b36::t_ade125ef7c5dbe 1-4
+packages/db/drizzle/meta/_journal.json
+  s_4792c0a8c09b36::t_86a0bde853cffd 1397-1403
+packages/db/src/schema/domain.ts
+  s_4792c0a8c09b36::t_69098953abf9cf 51-58
+packages/platform/src/engine/lib/project-route-store.ts
+  s_4792c0a8c09b36::t_e195ef34e6f533 147-149
+packages/platform/src/engine/lib/routing-domains.ts
+  s_4792c0a8c09b36::t_7892f8a34918b9 521-529,598-616
+packages/platform/src/engine/modules/domains/domain.operations.ts
+  s_4792c0a8c09b36::t_68dd3b76d889d2 149-155
+packages/platform/src/engine/modules/domains/domain.service.ts
+  s_4792c0a8c09b36::t_3f1b51da583354 73-74,221-227,252-264,268,333,348-349,417-420,489-491,542,547-660,1426-1428
+packages/platform/src/engine/modules/services/service.service.ts
+  s_4792c0a8c09b36::t_ce3cf31a9966d9 1010-1014,1297-1299
+packages/sdk/src/domain-client.ts
+  s_4792c0a8c09b36::t_add64c81f7c6ca 27
+scripts/docs-api-reference.json
+  s_4792c0a8c09b36::t_1a0a784c157f95 873-878
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "681be74fc3a9e575758622ad29c3246bffebe944",
+  "prompts": {},
+  "sessions": {
+    "s_4792c0a8c09b36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e6ec4cec-2d53-4609-b9ea-53e010c0822e",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
