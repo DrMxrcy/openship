@@ -177,7 +177,7 @@ export function buildCompositeRegistration(input: {
  * that path to the root service or a 404. Unlike `buildCompositeRegistration` this
  * expresses ARBITRARY multi-service fan-out, not the 1-static + 1-server shape.
  */
-type DomainOwners = ReadonlyMap<string, Pick<Domain, "serviceId">>;
+type DomainOwners = ReadonlyMap<string, Pick<Domain, "serviceId"> & Partial<Pick<Domain, "boundByDomain">>>;
 
 /** Resolve stored topology against current endpoint ports and domain ownership. */
 export function resolveDomainFanoutRoutes(input: {
@@ -186,6 +186,9 @@ export function resolveDomainFanoutRoutes(input: {
   domainByHostname?: DomainOwners;
 }): ProjectCompositeRoute[] {
   return (input.routes ?? []).flatMap((route) => {
+    // A tenant row owns the whole hostname. Stale project fan-out must neither
+    // override a moved binding nor reactivate an explicitly unbound domain.
+    if (input.domainByHostname?.get(route.hostname.toLowerCase())?.boundByDomain) return [];
     if (!route.rootServiceId) {
       // Path-only domains belong to the project, with no implicit service at `/`.
       // Keep the complete table: a missing path target must block replacement.

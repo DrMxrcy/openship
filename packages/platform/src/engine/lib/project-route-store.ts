@@ -130,6 +130,7 @@ export async function syncProjectPublicRoutes(
   );
 
   for (const domain of existingDomains) {
+    if (domain.boundByDomain) continue;
     if (!desiredByHostname.has(domain.hostname.toLowerCase())) {
       // A deploy payload describes this release, not the user's durable domain
       // configuration. Keep every custom row it omits, including pending rows;

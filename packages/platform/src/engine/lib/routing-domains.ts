@@ -294,6 +294,9 @@ export function buildProjectRouteDomains(opts: {
 
     const managed = resolveManagedHostname(normalized);
     const domainRow = domainByHostname.get(normalized);
+    // Row-owned bindings (including an unbound tenant) never inherit a project
+    // endpoint or the single-app/static fallback destination.
+    if (domainRow?.boundByDomain) return;
     const isVerified = managed.isManaged
       ? true
       : route.verified ?? domainRow?.verified ?? false;
@@ -404,7 +407,7 @@ export function buildProjectRouteDomains(opts: {
   // destination may use the single app's serving port, matching live routing
   // repair. ensureRouteDomainRecord persists that mapping before registration.
   for (const domain of projectDomains) {
-    if (domain.serviceId) continue;
+    if (domain.serviceId || domain.boundByDomain) continue;
     if (domain.domainType === "free" && !domain.verified) continue;
     // Explicit endpoints own the generated/free route set. Custom domain rows
     // remain durable configuration, including ones verified during this build.

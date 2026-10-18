@@ -46,7 +46,8 @@ export const DomainSchema = Type.Object({
   createdAt: Type.String(), updatedAt: Type.String(),
   diagnostics: Type.Optional(Type.Union([DomainDiagnosticsSchema, Type.Null()])),
   /** True when this row owns its serviceId/targetPort binding (POST/PATCH /domains)
-   *  rather than mirroring the service's publicEndpoints. Absent on older servers. */
+   *  rather than mirroring publicEndpoints. Retained when explicitly unbound
+   *  (serviceId null) so the hostname stays unrouted. Absent on older servers. */
   boundByDomain: Type.Optional(Type.Boolean()),
 });
 export type Domain = Static<typeof DomainSchema>;

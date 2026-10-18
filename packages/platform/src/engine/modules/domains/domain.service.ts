@@ -150,6 +150,19 @@ export interface AddDomainResult {
 export async function addDomain(
   ctx: RequestContext,
   data: TAddDomainBody,
+  opts: Parameters<typeof addDomainUnlocked>[2] = {},
+): Promise<AddDomainResult> {
+  if (!data.serviceId) return addDomainUnlocked(ctx, data, opts);
+  const project = await repos.project.findById(data.projectId);
+  assertResourceInOrg(project, "Project", ctx.organizationId, data.projectId);
+  const result = await withLiveProjectRuntimeMutation(data.projectId, () => addDomainUnlocked(ctx, data, opts));
+  if (!result) throw new NotFoundError("Project");
+  return result;
+}
+
+async function addDomainUnlocked(
+  ctx: RequestContext,
+  data: TAddDomainBody,
   opts: {
     /**
      * Hostnames the caller has ALREADY established this project owns, unioned
@@ -589,8 +602,6 @@ async function resolveDomainServiceBinding(
 /** Re-plan the project's live routes, which now include its domain-bound rows.
  *  Best-effort like every live route apply: the row is already saved, and the
  *  next deploy registers it if the edge is unreachable now. */
-// ponytail: recompiles every route of the project per bind, so bulk-adding N tenant
-// domains costs O(N²) vhost writes; register just the one route if that shows up.
 async function applyBoundDomainRoutes(projectId: string): Promise<void> {
   const { applyProjectRouting } = await import("./routing-apply.service");
   await withLiveProjectRuntimeMutation(projectId, () => applyProjectRouting(projectId)).catch((err) => {
@@ -605,6 +616,14 @@ async function applyBoundDomainRoutes(projectId: string): Promise<void> {
  * verification and certificate) so it can be bound again.
  */
 export async function updateDomain(ctx: RequestContext, domainId: string, data: TUpdateDomainBody) {
+  const current = await getDomainWithAuth(domainId, ctx.organizationId);
+  const result = await withLiveProjectRuntimeMutation(current.project.id, () => updateLiveDomainBinding(ctx, domainId, data));
+  if (!result) throw new NotFoundError("Project");
+  return result;
+}
+
+async function updateLiveDomainBinding(ctx: RequestContext, domainId: string, data: TUpdateDomainBody) {
+  // Re-read the binding and service after acquiring the deployment/teardown lock.
   const { domain, project } = await getDomainWithAuth(domainId, ctx.organizationId);
   if (domain.ownerType !== "project") {
     throw new ValidationError("Only a project domain can be bound to a service.");
@@ -631,11 +650,9 @@ export async function updateDomain(ctx: RequestContext, domainId: string, data: 
         removes: [{ hostname: domain.hostname, isCustomDomain: domain.domainType === "custom" }],
       }).catch((err) => {
         errorDiagnostics.error("platform/engine/modules/domains/domain.service", `[DOMAIN] Failed to remove route for ${domain.hostname}:`, err);
-        if (liveProject.workspaceId) {
-          throw new AppError("Could not remove the cloud route. The binding was kept so you can retry.", 502, "CLOUD_ROUTE_REMOVAL_FAILED");
-        }
+        throw new AppError("Could not remove the route. The binding was kept so you can retry.", 502, "DOMAIN_ROUTE_REMOVAL_FAILED");
       });
-      await repos.domain.update(domain.id, { serviceId: null, targetPort: null, boundByDomain: false });
+      await repos.domain.update(domain.id, { serviceId: null, targetPort: null, boundByDomain: true });
     });
     return getDomain(ctx, domainId);
   }

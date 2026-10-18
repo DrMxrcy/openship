@@ -48,7 +48,18 @@ import {
   updateDomain,
 } from "@repo/platform/engine/modules/domains/domain.service";
 import { updateService } from "@repo/platform/engine/modules/services/service.service";
-import { buildServiceRouteDomains } from "@repo/platform/engine/lib/routing-domains";
+import {
+  buildProjectRouteDomains,
+  buildServiceRouteDomains,
+} from "@repo/platform/engine/lib/routing-domains";
+import { resolveDomainFanoutRoutes } from "@repo/platform/engine/modules/deployments/compose/composite-route";
+import { syncProjectPublicRoutes } from "@repo/platform/engine/lib/project-route-store";
+import { withProjectRuntimeLock } from "@repo/platform/engine/lib/project-runtime-lock";
+import { Hono } from "hono";
+import { OpenshipClient } from "@repo/sdk/client";
+import { healthRoutes } from "../../../src/modules/health/health.routes";
+import { domainRoutes } from "../../../src/modules/domains/domain.routes";
+import { handleApiError } from "../../../src/middleware/error-handler";
 import type { ServicePublicEndpoint } from "@repo/db";
 
 beforeEach(() => {
@@ -241,8 +252,47 @@ describe("domain rows bound to a service", () => {
     expect(await repos.domain.findById(a.id)).toMatchObject({
       serviceId: null,
       targetPort: null,
-      boundByDomain: false,
+      boundByDomain: true,
     });
+    // Unbound tenant rows must not turn into project routes on the next deploy,
+    // even when the project has a static/default destination or a stale endpoint.
+    const unbound = (await repos.domain.findById(a.id))!;
+    for (const extras of [
+      { isStatic: true },
+      { defaultTargetPort: 4000 },
+      {
+        publicEndpoints: [{ domainType: "custom" as const, customDomain: first, port: 4000 }],
+      },
+    ]) {
+      expect(
+        buildProjectRouteDomains({
+          project: s.project,
+          projectDomains: [unbound],
+          runtimeName: "docker",
+          usesManagedRouting: true,
+          ...extras,
+        }),
+      ).toEqual([]);
+    }
+
+    expect(
+      resolveDomainFanoutRoutes({
+        routes: [
+          {
+            hostname: first,
+            isCustomDomain: true,
+            rootServiceId: s.service.id,
+            rootPort: 4000,
+            locations: [],
+          },
+        ],
+        services: [s.service],
+        domainByHostname: new Map([[first, unbound]]),
+      }),
+    ).toEqual([]);
+
+    await syncProjectPublicRoutes({ projectId: s.project.id, endpoints: [] });
+    expect(await repos.domain.findById(a.id)).toMatchObject({ boundByDomain: true });
 
     await removeDomain(s.ctx, b.id);
     expect(h.edge.mock.calls.at(-1)?.[1].removes).toEqual([
@@ -257,5 +307,99 @@ describe("domain rows bound to a service", () => {
     await expect(updateDomain(s.ctx, primaryRow.id, { serviceId: null })).rejects.toThrow(
       "public endpoints",
     );
+  });
+});
+
+it("retains a tenant binding when route removal fails", async () => {
+  const s = await seed();
+  const { domain } = await addDomain(s.ctx, {
+    projectId: s.project.id,
+    hostname: `fail-${s.label}.example.org`,
+    serviceId: s.service.id,
+  });
+  h.edge.mockRejectedValueOnce(new Error("edge unreachable"));
+  await expect(updateDomain(s.ctx, domain.id, { serviceId: null })).rejects.toThrow(
+    "binding was kept",
+  );
+  expect(await repos.domain.findById(domain.id)).toMatchObject({
+    serviceId: s.service.id,
+    boundByDomain: true,
+  });
+});
+
+it("uses the authenticated SDK/HTTP operation and rejects foreign organizations and malformed edits", async () => {
+  const actor = await seedOwner();
+  const s = await seedProject(actor.orgId, "transport");
+  const app = new Hono()
+    .onError(handleApiError)
+    .route("/api/health", healthRoutes)
+    .route("/api/domains", domainRoutes);
+  const client = new OpenshipClient({
+    baseUrl: "http://openship.test",
+    token: actor.token,
+    organizationId: actor.orgId,
+    fetch: ((url, init) => app.request(url as string, init)) as typeof fetch,
+  });
+  const { domain } = await client.domains.create(s.project.id, {
+    hostname: `transport-${s.label}.example.org`,
+    serviceId: s.service.id,
+  });
+  expect(await client.domains.update(domain.id, { targetPort: 9000 })).toMatchObject({
+    serviceId: s.service.id,
+    targetPort: 9000,
+    boundByDomain: true,
+  });
+  const other = await seedOwner();
+  const denied = await app.request(`/api/domains/${domain.id}`, {
+    method: "PATCH",
+    headers: {
+      ...other.auth,
+      "content-type": "application/json",
+      "x-organization-id": other.orgId,
+    },
+    body: JSON.stringify({ serviceId: null }),
+  });
+  expect(denied.status).toBe(404);
+  const invalid = await app.request(`/api/domains/${domain.id}`, {
+    method: "PATCH",
+    headers: {
+      ...actor.auth,
+      "content-type": "application/json",
+      "x-organization-id": actor.orgId,
+    },
+    body: JSON.stringify({ targetPort: 65536 }),
+  });
+  expect(invalid.status).toBe(400);
+  expect(await repos.domain.findById(domain.id)).toMatchObject({ targetPort: 9000 });
+});
+
+it("rechecks the selected service after a queued binding edit acquires the project lock", async () => {
+  const s = await seed();
+  const { domain } = await addDomain(s.ctx, {
+    projectId: s.project.id,
+    hostname: `queue-${s.label}.example.org`,
+  });
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const owner = withProjectRuntimeLock(s.project.id, async () => {
+    enter();
+    await held;
+  });
+  await entered;
+  const edit = updateDomain(s.ctx, domain.id, { serviceId: s.service.id });
+  const result = expect(edit).rejects.toThrow("not serving public traffic");
+  await repos.service.update(s.service.id, { exposed: false });
+  release();
+  await owner;
+  await result;
+  expect(await repos.domain.findById(domain.id)).toMatchObject({
+    serviceId: null,
+    boundByDomain: false,
   });
 });
