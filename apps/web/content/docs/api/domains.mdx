@@ -161,6 +161,7 @@ to get valid IDs.
 | List domains using the supplied filters. | `domains.list(id)` | `GET /api/domains`<br />`domain:list` |
 | Attach a domain using the requested project and routing configuration. | `domains.create(id, input)` | `POST /api/domains`<br />`domain:write` |
 | Read one domain record. | `domains.get(id)` | `GET /api/domains/:id`<br />`domain:read` |
+| Bind a domain to a service of its project and port, or unbind it with serviceId null. | `domains.update(id, input)` | `PATCH /api/domains/:id`<br />`domain:write` |
 | Remove a domain and its routing binding. | `domains.remove(id)` | `DELETE /api/domains/:id`<br />`domain:admin` |
 | Run domain verification. | `domains.verify(id, input?)` | `POST /api/domains/:id/verify`<br />`domain:write` |
 | Read DNS records required by a domain. | `domains.records(id, input?)` | `GET /api/domains/:id/records`<br />`domain:read` |
