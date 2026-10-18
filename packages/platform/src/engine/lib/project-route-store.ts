@@ -144,6 +144,9 @@ export async function syncProjectPublicRoutes(
 
   for (const route of desiredRoutes) {
     let existing = existingByHostname.get(route.hostname);
+    // Routed from its own row to a service (POST/PATCH /domains). A project
+    // endpoint list naming it must not pull it back to project level.
+    if (existing?.boundByDomain) continue;
 
     // A route IS a domain. Free (`*.opsh.io`) routes are host-managed → live
     // immediately. CUSTOM routes must prove DNS ownership first, so a NEW

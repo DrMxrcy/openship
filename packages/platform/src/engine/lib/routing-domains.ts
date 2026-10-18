@@ -518,7 +518,15 @@ export function buildServiceRouteDomains(opts: {
   // primary free route alive with its default `<project>-<service>` label even
   // before a slug is persisted, so an exposed service is never silently
   // unrouted. See resolveServicePublicEndpoints.
-  const endpoints = resolveServiceRouteEndpoints(opts);
+  const endpoints = [
+    // A hostname bound by its own domain row is planned from that row (below),
+    // never from a list entry that happens to name it.
+    ...resolveServiceRouteEndpoints(opts).filter((endpoint) => {
+      const hostname = endpoint.domainType === "custom" ? endpoint.customDomain : undefined;
+      return !(hostname && opts.domainByHostname?.get(normalizeCustomHostname(hostname))?.boundByDomain);
+    }),
+    ...domainBoundServiceEndpoints(service, opts.domainByHostname),
+  ];
   const planned: PlannedRouteDomain[] = [];
   const seen = new Set<string>();
 
@@ -585,6 +593,25 @@ export function buildServiceRouteDomains(opts: {
   }
 
   return planned;
+}
+
+/**
+ * Custom domains bound to this service by their own row (POST/PATCH /domains
+ * with serviceId + targetPort). They are not entries of the service's
+ * `publicEndpoints`, so they don't count toward its cap and list edits never
+ * touch them. Same `exposed` gate as the list: pausing the service pauses them.
+ */
+function domainBoundServiceEndpoints(
+  service: Service,
+  domainByHostname?: ReadonlyMap<string, Domain>,
+): StoredPublicEndpoint[] {
+  const endpoints: StoredPublicEndpoint[] = [];
+  for (const row of domainByHostname?.values() ?? []) {
+    if (!row.boundByDomain || row.serviceId !== service.id || !row.targetPort) continue;
+    if (row.status === "removing") continue;
+    endpoints.push({ port: row.targetPort, domainType: "custom", customDomain: row.hostname });
+  }
+  return endpoints.sort((a, b) => a.customDomain!.localeCompare(b.customDomain!));
 }
 
 /**
