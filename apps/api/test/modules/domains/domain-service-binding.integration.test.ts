@@ -403,3 +403,24 @@ it("rechecks the selected service after a queued binding edit acquires the proje
     boundByDomain: false,
   });
 });
+
+it("retains service paths while the domain row authoritatively owns and moves its root", async () => {
+  const s = await seed();
+  const hostname = `paths-${s.label}.example.org`;
+  const { domain } = await addDomain(s.ctx, {
+    projectId: s.project.id, hostname, serviceId: s.service.id,
+  });
+  const stored = {
+    hostname, isCustomDomain: true, rootServiceId: s.service.id, rootPort: 4000,
+    locations: [{ pathPrefix: "/api", serviceId: s.service.id, port: 9000 }],
+  };
+  const resolve = (owner: typeof domain, services: typeof s.service[]) => resolveDomainFanoutRoutes({
+    routes: [stored], services, domainByHostname: new Map([[hostname, owner]]),
+  });
+  expect(resolve(domain, [s.service])).toEqual([stored]);
+  const replacement = { ...s.service, id: "replacement", exposedPort: 9000 };
+  expect(resolve({ ...domain, serviceId: replacement.id, targetPort: 9000 }, [s.service, replacement]))
+    .toEqual([{ ...stored, rootServiceId: replacement.id, rootPort: 9000 }]);
+  expect(resolve({ ...domain, serviceId: null, targetPort: null }, [s.service])).toEqual([]);
+  expect(resolve(domain, [{ ...s.service, exposed: false }])).toEqual([]);
+});
