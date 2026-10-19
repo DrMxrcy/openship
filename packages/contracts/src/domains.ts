@@ -1,5 +1,5 @@
 import { Type, type Static } from "@sinclair/typebox";
-import { AddDomainBody, PreviewDomainBody, UpdateDomainBody, UploadCertBody } from "./domain-inputs";
+import { AddDomainBody, DomainPageQuery, PreviewDomainBody, UpdateDomainBody, UploadCertBody } from "./domain-inputs";
 import { ResourceIdSchema, type DeploymentEvent } from "./deployment-resources";
 import type { StreamOptions } from "./services";
 import type { ResourceOperations, ResourceOperationSchema, ScopedOperations } from "./resource-operations";
@@ -157,8 +157,14 @@ export const PendingDomainVerificationSchema = Type.Object({
   })),
 });
 
+export const DomainPageSchema = Type.Object({
+  domains: Type.Array(DomainSchema),
+  nextCursor: Type.Optional(Type.String()),
+});
+export type DomainPage = Static<typeof DomainPageSchema>;
 export const DomainCollectionSchemas = {
   list: { action: "read", output: Type.Array(DomainSchema) },
+  listPage: { action: "read", input: DomainPageQuery, output: DomainPageSchema },
   create: { action: "write", input: CreateDomainInputSchema, output: CreateDomainResultSchema },
 } as const satisfies Record<string, ResourceOperationSchema>;
 export const DomainResourceSchemas = {

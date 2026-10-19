@@ -11,6 +11,12 @@ export function createRemoteDomainOperations(http: HttpClient): DomainOperations
   return Object.freeze({
     ...createRemoteResourceOperations(http, DomainCollectionSchemas, {
       list: { method: "GET", path: (id) => `/domains?projectId=${encodeURIComponent(id)}`, envelope: "data" },
+      listPage: {
+        method: "GET", path: (id) => `/domains?projectId=${encodeURIComponent(id)}`,
+        response: (body) => isRecord(body) ? {
+          domains: body.data, ...(typeof body.nextCursor === "string" && { nextCursor: body.nextCursor }),
+        } : undefined,
+      },
       create: {
         method: "POST", path: () => "/domains",
         body: (id, input) => ({ ...(isRecord(input) ? input : {}), projectId: id }),

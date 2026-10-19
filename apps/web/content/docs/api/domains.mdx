@@ -109,6 +109,34 @@ list's cap. Editing that list leaves them intact; deleting one removes only that
 the project's live routing flow; unavailable routing can still require Retry routing or a redeploy.
 DNS verification and certificates remain per hostname. Service deletion also deletes its bound domains.
 
+## List domains page by page
+
+`GET /api/domains?projectId=` returns every domain of the project. Add any of the parameters below
+to read one page instead, ordered by hostname. The response keeps its `data` array and adds
+`nextCursor` while more domains match; pass it back as `cursor` with the same filters.
+
+```ts
+let cursor: string | undefined;
+do {
+  const page = await ship.domains.listPage("proj_123", { limit: 50, q: "tenant", cursor });
+  console.log(page.domains.map((domain) => domain.hostname));
+  cursor = page.nextCursor;
+} while (cursor);
+```
+
+<TypeTable
+  type={{
+    limit: { type: 'number', description: 'Domains per page, 1 to 200. Required by the SDK.', default: '50' },
+    cursor: { type: 'string', description: 'The previous response\'s nextCursor.' },
+    q: { type: 'string', description: 'Case-insensitive part of the hostname.' },
+    status: { type: "'pending' | 'active' | 'failed' | 'removing'", description: 'Verification status.' },
+    serviceId: { type: 'string', description: 'Only domains routed to this service, from its endpoint list or their own binding.' },
+    bound: { type: 'boolean', description: 'Match boundByDomain: true for domains that own their service binding.' },
+  }}
+/>
+
+`openship domain list --project proj_123 --limit 50` prints one page and the `--cursor` for the next.
+
 ## Verify a domain
 
 <Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
@@ -186,6 +214,7 @@ to get valid IDs.
 | --- | --- | --- |
 | Stream domain verification progress. | `domains.verifyStream(id, input?, options?)` | `POST /api/domains/:id/verify/stream`<br />`domain:write` |
 | List domains using the supplied filters. | `domains.list(id)` | `GET /api/domains`<br />`domain:list` |
+| Read one hostname-ordered page of a project's domains with search and binding filters. | `domains.listPage(id, input)` | `GET /api/domains`<br />`domain:list` |
 | Attach a domain using the requested project and routing configuration. | `domains.create(id, input)` | `POST /api/domains`<br />`domain:write` |
 | Read one domain record. | `domains.get(id)` | `GET /api/domains/:id`<br />`domain:read` |
 | Bind a domain to a service of its project and port, or unbind it with serviceId null. | `domains.update(id, input)` | `PATCH /api/domains/:id`<br />`domain:write` |

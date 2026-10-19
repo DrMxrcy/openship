@@ -12,8 +12,28 @@ export const DomainIdParam = Type.Object({
 
 // ─── Query params ────────────────────────────────────────────────────────────
 
+export const DOMAIN_PAGE_DEFAULT_LIMIT = 50;
+
+/**
+ * Paging and filters for GET /domains. Without any of them the endpoint keeps
+ * returning every row; with any of them it returns one page ordered by hostname
+ * and a `nextCursor` while more rows match.
+ */
+export const DomainPageQuery = Type.Object({
+  limit: Type.Integer({ minimum: 1, maximum: 200, description: `Rows per page. Defaults to ${DOMAIN_PAGE_DEFAULT_LIMIT} over HTTP.` }),
+  cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 1024, description: "nextCursor from the previous page." })),
+  q: Type.Optional(Type.String({ minLength: 1, maxLength: 253, description: "Case-insensitive hostname substring." })),
+  status: Type.Optional(Type.Union(
+    [Type.Literal("pending"), Type.Literal("active"), Type.Literal("failed"), Type.Literal("removing")],
+    { description: "Verification status." },
+  )),
+  serviceId: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Only domains routed to this service." })),
+  bound: Type.Optional(Type.Boolean({ description: "Match boundByDomain: true for domains that own their service binding." })),
+});
+
 export const ListDomainsQuery = Type.Object({
   projectId: Type.String({ minLength: 1 }),
+  ...Type.Partial(DomainPageQuery).properties,
 });
 
 // ─── Request bodies ──────────────────────────────────────────────────────────
@@ -112,6 +132,7 @@ export const PreviewDomainBody = Type.Object({
 
 export type TDomainIdParam = Static<typeof DomainIdParam>;
 export type TListDomainsQuery = Static<typeof ListDomainsQuery>;
+export type TDomainPageQuery = Static<typeof DomainPageQuery>;
 export type TAddDomainBody = Static<typeof AddDomainBody>;
 export type TUpdateDomainBody = Static<typeof UpdateDomainBody>;
 export type TUploadCertBody = Static<typeof UploadCertBody>;

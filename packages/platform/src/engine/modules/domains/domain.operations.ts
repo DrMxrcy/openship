@@ -135,6 +135,10 @@ export const domainDependencies: DomainDependencies = {
       await projectAuthority(ctx, id);
       return service.listDomains(ctx, id);
     },
+    async listPage(ctx, id, input) {
+      await projectAuthority(ctx, id);
+      return service.listDomainPage(ctx, id, input);
+    },
     async create(ctx, id, input) {
       await projectAuthority(ctx, id);
       const result = await service.addDomain(ctx, { ...input, projectId: id });

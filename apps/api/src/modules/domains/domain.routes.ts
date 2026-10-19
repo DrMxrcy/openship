@@ -6,6 +6,7 @@
 
 import { Hono } from "hono";
 import {
+  DomainPageQuery,
   DomainResourceSchemas,
   VerifyPendingDomainsInputSchema,
   ResourceIdSchema,
@@ -24,7 +25,7 @@ const r = secureRouter(new Hono(), {
 });
 
 /* ─── Domains ──────────────────────────────────────────────────────────── */
-r.get("/", { tag: "domain:list", collectionProject: "query", mcp: { description: "List domains for the project named by the projectId query parameter." }, query: Type.Object({ projectId: ResourceIdSchema }) }, ctrl.list);
+r.get("/", { tag: "domain:list", collectionProject: "query", mcp: { description: "List domains for the project named by the projectId query parameter. Pass limit, cursor, q, status, serviceId or bound to read one hostname-ordered page; the response then carries nextCursor while more rows match." }, query: Type.Object({ projectId: ResourceIdSchema, ...Type.Partial(DomainPageQuery).properties }) }, ctrl.list);
 r.post(
   "/",
   {

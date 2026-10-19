@@ -70,7 +70,7 @@ import {
   assertRedirectTargets,
   normalizeRedirect,
 } from "../../lib/domain-redirect";
-import type { TAddDomainBody, TUpdateDomainBody } from "@repo/contracts";
+import type { TAddDomainBody, TDomainPageQuery, TUpdateDomainBody } from "@repo/contracts";
 import { parseServicePort, resolveServicePort } from "../../lib/deployable-service";
 import { certbotLineageDirs, edgeProxy, readEdgeFile, validateCertFor } from "@repo/adapters";
 import type { AdoptedCert, CloudInfraProvider, ManualCert } from "@repo/adapters";
@@ -92,6 +92,14 @@ export async function listDomains(ctx: RequestContext, projectId: string) {
   const project = await repos.project.findById(projectId);
   assertResourceInOrg(project, "Project", ctx.organizationId, projectId);
   return withDomainDiagnostics(project, await repos.domain.listByProject(projectId));
+}
+
+/** One hostname-ordered page of a project's domains, with optional filters. */
+export async function listDomainPage(ctx: RequestContext, projectId: string, query: TDomainPageQuery) {
+  const project = await repos.project.findById(projectId);
+  assertResourceInOrg(project, "Project", ctx.organizationId, projectId);
+  const { rows, nextCursor } = await repos.domain.pageByProject(projectId, query);
+  return { domains: await withDomainDiagnostics(project, rows), ...(nextCursor && { nextCursor }) };
 }
 
 /**

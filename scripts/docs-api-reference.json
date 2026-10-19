@@ -858,6 +858,13 @@
       "description": "List domains using the supplied filters.",
       "route": "GET /api/domains"
     },
+    "domains.listPage": {
+      "page": "domains",
+      "section": "Operations",
+      "description": "Read one hostname-ordered page of a project's domains with search and binding filters.",
+      "route": "GET /api/domains",
+      "sharedRoute": true
+    },
     "domains.create": {
       "page": "domains",
       "section": "Operations",
