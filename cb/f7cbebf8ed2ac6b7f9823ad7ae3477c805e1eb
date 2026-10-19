@@ -1,0 +1,44 @@
+apps/dashboard/src/app/(dashboard)/projects/[id]/components/services/domain-binding.test.tsx
+  s_4792c0a8c09b36::t_9221123fb87c01 1-189,197-198
+  s_4792c0a8c09b36::t_99be7adab861a9 190-196,199-338
+apps/dashboard/src/app/(dashboard)/projects/[id]/components/DomainSettings.tsx
+  s_4792c0a8c09b36::t_a6856b6805e88b 115-118,341-342,641-648,692-732,1764-1780,1867,1894-1941,1944,1948-2004,2134,2748-2757,2871-2874,2905-2915,3008-3087,3535
+apps/dashboard/src/i18n/locales/ar/projectSettings.json
+  s_4792c0a8c09b36::t_01ca3525f6055c 961-962,1153-1180
+apps/dashboard/src/i18n/locales/de/projectSettings.json
+  s_4792c0a8c09b36::t_25ed2a4418fa8f 961-962,1153-1180
+apps/dashboard/src/i18n/locales/en/projectSettings.json
+  s_4792c0a8c09b36::t_0e8962c2a54d48 1032-1033,1202-1229
+apps/dashboard/src/i18n/locales/es/projectSettings.json
+  s_4792c0a8c09b36::t_33b8d3a4e51e55 961-962,1153-1180
+apps/dashboard/src/i18n/locales/fr/projectSettings.json
+  s_4792c0a8c09b36::t_e472861829fdaf 961-962,1153-1180
+apps/dashboard/src/i18n/locales/ja/projectSettings.json
+  s_4792c0a8c09b36::t_2b0cd9b02c8be6 961-962,1153-1180
+apps/dashboard/src/i18n/locales/pt/projectSettings.json
+  s_4792c0a8c09b36::t_513612c389fc18 961-962,1153-1180
+apps/dashboard/src/i18n/locales/ru/projectSettings.json
+  s_4792c0a8c09b36::t_6df5002a05e493 1032-1033,1202-1229
+apps/dashboard/src/i18n/locales/tr/projectSettings.json
+  s_4792c0a8c09b36::t_aa8151aa0be6e8 1032-1033,1202-1229
+apps/dashboard/src/i18n/locales/zh/projectSettings.json
+  s_4792c0a8c09b36::t_41651c25a2c9b5 961-962,1153-1180
+apps/dashboard/src/lib/api/domains.ts
+  s_4792c0a8c09b36::t_64459e6ff629e1 4-6,64-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cbf7cbebf8ed2ac6b7f9823ad7ae3477c805e1eb",
+  "prompts": {},
+  "sessions": {
+    "s_4792c0a8c09b36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e6ec4cec-2d53-4609-b9ea-53e010c0822e",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
