@@ -1,0 +1,48 @@
+apps/api/test/modules/domains/domain-list-page.integration.test.ts
+  s_4792c0a8c09b36::t_03739d998c385a 1-98
+  s_4792c0a8c09b36::t_b7269b6245d41a 99-150
+apps/api/src/modules/domains/domain.controller.ts
+  s_4792c0a8c09b36::t_5107be2bafcb7c 4,23-43
+apps/api/src/modules/domains/domain.routes.ts
+  s_4792c0a8c09b36::t_257f5493ae2662 9,28
+apps/cli/src/commands/domain.ts
+  s_4792c0a8c09b36::t_59809cdbbd3ec3 10,54-55,58-62,64,68
+apps/web/content/docs/api/domains.mdx
+  s_4792c0a8c09b36::t_9d1fbe5f205f52 112-139,217
+apps/web/content/docs/api/mcp-tools.mdx
+  s_4792c0a8c09b36::t_e8a2aa6ea5d2ae 213
+apps/web/content/docs/cli/reference/domain/index.mdx
+  s_4792c0a8c09b36::t_beaeabbf0d8f0b 74-75
+packages/contracts/src/domain-inputs.ts
+  s_4792c0a8c09b36::t_1ca52b21773925 15-33,36,135
+packages/contracts/src/domains.ts
+  s_4792c0a8c09b36::t_6c649419e1463e 2,160-164,167
+packages/db/src/repos/domain.repo.ts
+  s_4792c0a8c09b36::t_c96702144d58a9 9,12,290-316
+packages/platform/src/engine/modules/domains/domain.operations.ts
+  s_4792c0a8c09b36::t_a3d33eece13e9e 138-141
+packages/platform/src/engine/modules/domains/domain.service.ts
+  s_4792c0a8c09b36::t_0e45390e5d9e39 73,97-104
+packages/sdk/src/domain-client.ts
+  s_4792c0a8c09b36::t_93301f8e534289 14-19
+scripts/docs-api-reference.json
+  s_4792c0a8c09b36::t_b19355a766b969 861-867
+scripts/generate-api-reference.mjs
+  s_4792c0a8c09b36::t_5bf900526be024 32-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "624e4ce3c5e644af9b4368bfca42a44e8b421604",
+  "prompts": {},
+  "sessions": {
+    "s_4792c0a8c09b36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e6ec4cec-2d53-4609-b9ea-53e010c0822e",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "DrMxrcy <drmxrcy@gmail.com>"
+    }
+  }
+}
