@@ -1,5 +1,7 @@
 "use client";
 
+import { cloudSpaceHref } from "@/lib/cloud-spaces";
+import { observedAllSettled, reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
@@ -74,10 +76,10 @@ function CheckoutConfirmation({
     }
     async function refresh() {
       try {
-        const [stateResult, checkoutResult] = await Promise.allSettled([
+        const [stateResult, checkoutResult] = await observedAllSettled([
           billingApi.getBillingState(workspaceId),
           checkoutId ? billingApi.getCheckoutStatus(checkoutId, workspaceId) : null,
-        ]);
+        ], "dashboard/app/(dashboard)/billing/_components/BillingCheckoutStatus");
         if (disposed) return;
         setError(null);
         if (checkoutResult.status === "rejected") throw checkoutResult.reason;
@@ -168,6 +170,7 @@ function CheckoutConfirmation({
           setSetupServerId(null);
         }
       } catch (failure) {
+        observeCaughtError(failure, "dashboard/app/(dashboard)/billing/_components/BillingCheckoutStatus");
         // An outage cannot confirm readiness or undo a verified payment.
         if (!disposed) setError(failure instanceof Error ? failure.message : null);
       }
@@ -210,7 +213,7 @@ function CheckoutConfirmation({
             )}
             {showSetup && (
               <Button asChild variant="secondary" size="sm">
-                <Link href={`/servers/${encodeURIComponent(setupServerId)}?tab=activity`}>
+                <Link href={cloudSpaceHref(setupServerId!, "activity")}>
                   {t.billing.checkout.viewSetup}
                 </Link>
               </Button>

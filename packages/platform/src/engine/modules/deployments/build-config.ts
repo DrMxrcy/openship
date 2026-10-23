@@ -10,6 +10,8 @@ export interface BuildConfigSnapshotLike {
   branch: string;
   framework: string;
   buildImage: string;
+  runtimeVersion?: string;
+  runtimeImageOverride?: boolean;
   runtimeImage: string;
   packageManager: string;
   installCommand: string;
@@ -91,6 +93,8 @@ export function createBuildConfig(opts: BuildConfigFactoryOptions): BuildConfig 
     buildStrategy: snapshot.buildStrategy,
     stack: snapshot.framework,
     buildImage: snapshot.buildImage,
+    runtimeVersion: snapshot.runtimeVersion,
+    runtimeImageOverride: snapshot.runtimeImageOverride,
     runtimeImage: snapshot.runtimeImage,
     packageManager: snapshot.packageManager,
     installCommand: snapshot.hasBuild ? snapshot.installCommand : "",
@@ -107,6 +111,10 @@ export function createBuildConfig(opts: BuildConfigFactoryOptions): BuildConfig 
     gitToken,
     gitCredentialHelperPath,
     ...overrides,
+    // Run intent is shared by generated, Dockerfile and monorepo builds. A
+    // rollback replays its sources/artifacts without inheriting old pull hints.
+    refreshBaseImages: dep.trigger !== "rollback" &&
+      (snapshot.forcePullImages === true || dep.trigger === "update"),
   };
 }
 

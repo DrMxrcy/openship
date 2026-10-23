@@ -650,7 +650,6 @@ describe("billing through the same SDK and HTTP application operations", () => {
   });
 
   it.each([
-    ["hobby", 500, 0],
     ["starter", 2000, 0],
     ["pro", 3900, 0],
     ["team", 9900, 0],
@@ -668,9 +667,9 @@ describe("billing through the same SDK and HTTP application operations", () => {
       expect(input).toMatchObject({
         namespace: managed.namespace,
         kind: "subscription",
-        offer: { reference: `openship:${tier}:v10`, unitAmount, credits, billingMode: "monthly" },
+        offer: { reference: `openship:${tier}:v11`, unitAmount, credits, billingMode: "monthly" },
         billingInterval: "monthly",
-        metadata: { openship_organization: owner.orgId, openship_namespace: managed.namespace, openship_offer_version: "10" },
+        metadata: { openship_organization: owner.orgId, openship_namespace: managed.namespace, openship_offer_version: "11" },
       });
       expect(input).not.toHaveProperty("customer");
       expect(input).not.toHaveProperty("line_items");

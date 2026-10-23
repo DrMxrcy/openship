@@ -98,16 +98,30 @@ it.each([true, false])(
     mode.cloud = cloud;
     vi.resetModules();
     const { app } = await import("../../src/app");
+    const { observeRequestErrors } = await import("../../src/middleware/error-observation");
+    expect(app.routes[0]?.handler).toBe(observeRequestErrors);
     const { scanRoutes, enforceRouteScanAtBoot } = await import("../../src/lib/route-scanner");
     const result = scanRoutes(app);
     expect(result.summary.permissionGated).toBeGreaterThan(300);
     expect(result.errors).toEqual([]);
+    const { getRouteRegistry } = await import("../../src/lib/route-permission");
+    expect(
+      getRouteRegistry().find(
+        (route) =>
+          route.method === "POST" && route.path === "/api/updates/:projectId/runtime/check",
+      ),
+    ).toMatchObject({
+      spec: { tag: "project:read", readOnly: true, ids: { project: "projectId" } },
+    });
     const paths = new Set(app.routes.map((route) => route.path));
     expect(paths.has("/api/system/servers/:id/ensure")).toBe(true);
     expect(paths.has("/api/system/servers/:id/resize")).toBe(true);
     expect(paths.has("/api/system/onboarding")).toBe(!cloud);
     expect(paths.has("/api/migration/sources")).toBe(true);
+    expect(paths.has("/api/diagnostics/client-errors")).toBe(cloud);
     expect(paths.has("/api/migration/migrate")).toBe(true);
+    expect(paths.has("/api/actions/oidc/token")).toBe(true);
+    expect(paths.has("/api/actions/oidc/jwks")).toBe(true);
     const { getMcpTools, resetMcpToolCache } = await import("../../src/modules/mcp/mcp-tools");
     resetMcpToolCache();
     const names = getMcpTools().map((tool) => tool.name);

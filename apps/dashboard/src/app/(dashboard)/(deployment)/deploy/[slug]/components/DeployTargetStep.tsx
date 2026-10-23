@@ -1,5 +1,6 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 import React, { useEffect, useState } from "react";
@@ -16,9 +17,11 @@ import { usePlatform } from "@/context/PlatformContext";
 import { settingsApi, type DefaultDeployTarget } from "@/lib/api/settings";
 import { useToast } from "@/context/ToastContext";
 import type { DeployTarget, BuildStrategy, CloneStrategy, RuntimeMode, CloudResourceTier } from "@/context/deployment/types";
+import { CloudStaticHosting } from "@/components/project-settings/CloudStaticHosting";
 import ServerRuntimePicker, { type ServerRuntimeSelection } from "./ServerRuntimePicker";
 import { RollbackBackupPanel } from "./RollbackBackupPanel";
 import { useI18n, interpolate } from "@/components/i18n-provider";
+import { resolveBuildLocation } from "@/components/import-project/deploy-target-label";
 
 // ─── Compact summary (shown when editing from step 2) ────────────────────────
 
@@ -36,6 +39,7 @@ interface CompactSummaryProps {
    *  tier chip for a "Static" chip — there's no machine to size when
    *  the workload is just files served from the edge. */
   hasServer?: boolean;
+  cloudStaticHosting?: "pages" | "server";
   /** Runtime isolation shown in the configuration summary and settings preview. */
   runtimeMode?: RuntimeMode;
   /** True when the project deploys as a multi-service stack (compose). A stack
@@ -57,6 +61,7 @@ export const DeployTargetSummary: React.FC<CompactSummaryProps> = ({
   showBuildStrategy = true,
   cloudResourceTier,
   hasServer = true,
+  cloudStaticHosting,
   runtimeMode,
   isServices = false,
   rollbackWindow,
@@ -78,8 +83,15 @@ export const DeployTargetSummary: React.FC<CompactSummaryProps> = ({
   const tierLabels = useResourceTierLabels();
   const target = targetLabels[deployTarget];
   // Remote builds run on the selected destination.
+  const buildsHere = resolveBuildLocation({
+    deployTarget,
+    buildStrategy,
+    runtimeMode,
+    projectType: isServices ? "services" : "app",
+    options: { hasServer },
+  }) === "local";
   const build =
-    buildStrategy === "local"
+    buildsHere
       ? buildLabels.local
       : deployTarget === "cloud"
         ? { label: t.deploy.summary.targetCloud, icon: <UiIcon name="cloud" className="size-4" /> }
@@ -88,14 +100,11 @@ export const DeployTargetSummary: React.FC<CompactSummaryProps> = ({
     ? serverName
     : target.label;
 
-  // Build "destination" derived from (deployTarget, buildStrategy):
-  //   - buildStrategy === "local" → local machine
-  //   - buildStrategy === "server" → runs ON the deploy target
   // Same destination → collapse Build + Deploy into a single chip with
   // the two icons stacked + a `+` between them, instead of two
   // sections separated by an arrow. Most users have matching targets
   // (cloud-on-cloud, server-on-server), so this is the common case.
-  const buildDest = buildStrategy === "local" ? "local" : deployTarget;
+  const buildDest = buildsHere ? "local" : deployTarget;
   const sameDestination = showBuildStrategy && buildDest === deployTarget;
 
   // Right-hand chip on the summary — one at a time, by workload shape:
@@ -123,7 +132,9 @@ export const DeployTargetSummary: React.FC<CompactSummaryProps> = ({
   ) : !hasServer ? (
     <span className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground shrink-0">
       <UiIcon name="globe" className="size-4" />
-      {t.deploy.summary.runtimeStatic}
+      {deployTarget === "cloud" && cloudStaticHosting
+        ? t.projectSettings.cloudStaticHosting[cloudStaticHosting]
+        : t.deploy.summary.runtimeStatic}
     </span>
   ) : deployTarget === "cloud" && runtimeMode !== "bare" ? (
     cloudResourceTier ? (
@@ -170,7 +181,7 @@ export const DeployTargetSummary: React.FC<CompactSummaryProps> = ({
   );
 
   if (variant === "preview") {
-    const containerLimits = deployTarget === "cloud" && (isServices || runtimeMode !== "bare");
+    const containerLimits = deployTarget === "cloud" && (isServices || runtimeMode !== "bare" || (!hasServer && cloudStaticHosting === "server"));
     const runtimeLabel = !hasServer && !isServices
       ? t.deploy.summary.static
       : isServices || runtimeMode !== "bare"
@@ -310,8 +321,13 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ serverSelection, ru
       description: ts.build.remoteDesc,
     },
   ];
-  // Managed builds always execute on the selected server's adapter.
-  const visibleBuildOptions = config.deployTarget === "cloud" ? [] : buildOptions;
+  // Managed builds always execute on the selected server's adapter, and a server
+  // Docker build only runs on the server's daemon, so "This Machine" is not offered.
+  const localBuildAvailable = resolveBuildLocation({ ...config, buildStrategy: "local" }) === "local";
+  const visibleBuildOptions =
+    !selfHosted || config.deployTarget === "cloud"
+      ? []
+      : buildOptions.filter((opt) => opt.value !== "local" || localBuildAvailable);
 
   // Clone-location picker (DOCKER server deploys, incl. services). Bare always
   // clones on the target, so it keeps the credential-forwarding checkbox below
@@ -320,16 +336,15 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ serverSelection, ru
   // Services always deploy as docker (build on the server), so the clone picker
   // applies to them regardless of the config.runtimeMode field (which may not be
   // hydrated to "docker" on a config-edit).
-  // Clone location only exists for a REMOTE build (the clone runs on the target).
-  // "This Machine" (local build) clones + builds here and ships the output, so
-  // there's no on-server-vs-here choice to make — hide it entirely.
-  const showCloneStrategy =
+  // Docker builds on the target even when a legacy buildStrategy says "local".
+  // Keep source acquisition editable without promising local image builds.
+  const showCloneStrategy = selfHosted &&
     config.deployTarget === "server" &&
-    config.buildStrategy === "server" &&
-    (config.runtimeMode === "docker" || isServiceDeployment);
+    !localBuildAvailable;
   // Clone-on-server is the default (primary card); cloning on the api host and
   // uploading is the advanced/manual alternative.
-  const cloneStrategy: CloneStrategy = config.cloneStrategy ?? "server";
+  const cloneStrategy: CloneStrategy = config.cloneStrategy ??
+    (config.buildStrategy === "local" ? "api-host" : "server");
   const cloneOptions: Array<{
     value: CloneStrategy;
     icon: React.ReactNode;
@@ -355,15 +370,15 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ serverSelection, ru
     },
   ];
 
-  // Default the clone location to "on the server" for a brand-new deploy when
-  // the choice is UNSET. Git-identity forwarding is no longer a per-deploy
+  // Seed an unset clone choice without changing a legacy local-source request.
+  // Git-identity forwarding is no longer a per-deploy
   // choice — it's the operator-wide "Forward my git identity to build servers"
   // setting (Settings → Clone credentials), resolved server-side at build time.
   useEffect(() => {
     if (config.projectId) return;
     if (!showCloneStrategy) return;
-    if (config.cloneStrategy == null) updateConfig({ cloneStrategy: "server" });
-  }, [config.projectId, showCloneStrategy, config.cloneStrategy, updateConfig]);
+    if (config.cloneStrategy == null) updateConfig({ cloneStrategy });
+  }, [config.projectId, showCloneStrategy, config.cloneStrategy, cloneStrategy, updateConfig]);
 
 
   const canContinue = destinationReady && !resourceSelectionPending;
@@ -393,7 +408,8 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ serverSelection, ru
         defaultServerId: pickedTarget ? (config.serverId ?? null) : null,
       });
       showToast(ts.savedToast, "success", ts.savedToastTitle);
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/(deployment)/deploy/[slug]/components/DeployTargetStep");
       showToast(ts.saveFailedToast, "error", ts.savedToastTitle);
     } finally {
       setSavingDefault(false);
@@ -409,11 +425,23 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ serverSelection, ru
 
   const showSettings = showFullPicker && (serverSelection.ready || !!config.serverId) &&
     (config.deployTarget === "server" || config.deployTarget === "cloud");
+  const cloudStatic =
+    config.deployTarget === "cloud" &&
+    workloadOf(config.options) === "static" &&
+    config.projectType !== "docker" &&
+    !isServiceDeployment;
   const showRuntimeIsolation =
+    !cloudStatic &&
     (config.deployTarget === "cloud" || workloadOf(config.options) !== "static") &&
-    config.projectType !== "docker" && !isServiceDeployment;
-  const showResourceLimits = config.deployTarget === "cloud" &&
-    (config.runtimeMode !== "bare" || isServiceDeployment || config.projectType === "docker");
+    config.projectType !== "docker" &&
+    !isServiceDeployment;
+  const showResourceLimits =
+    (!cloudStatic || config.cloudStaticHosting === "server") &&
+    config.deployTarget === "cloud" &&
+    ((cloudStatic && config.cloudStaticHosting === "server") ||
+      config.runtimeMode !== "bare" ||
+      isServiceDeployment ||
+      config.projectType === "docker");
   const resourceValues = resolveTierResources(config.cloudResourceTier ?? "unlimited", config.cloudResourceCustom);
 
   // Saved connection defaults stay with the destination controls.
@@ -474,6 +502,14 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ serverSelection, ru
 
           {showSettings && (
             <>
+              {cloudStatic && (
+                <section className="rounded-2xl bg-card p-5">
+                  <CloudStaticHosting
+                    value={config.cloudStaticHosting ?? "pages"}
+                    onChange={(cloudStaticHosting) => updateConfig({ cloudStaticHosting })}
+                  />
+                </section>
+              )}
               {showRuntimeIsolation && (
                 <section className="rounded-2xl bg-card p-5" aria-label={t.deploy.runtime.heading}>
                   <ServerRuntimePicker selection={runtimeSelection} />
@@ -548,6 +584,7 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ serverSelection, ru
             serverName={summaryServerName}
             showBuildStrategy={showBuildStrategy}
             cloudResourceTier={config.cloudResourceTier}
+            cloudStaticHosting={config.cloudStaticHosting ?? "pages"}
             hasServer={workloadOf(config.options) !== "static"}
             runtimeMode={config.runtimeMode}
             isServices={isServiceDeployment}

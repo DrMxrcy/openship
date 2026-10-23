@@ -5,8 +5,11 @@
  */
 
 import { Type, type Static, type TLiteral } from "@sinclair/typebox";
+import { GitHubDeploymentChecksSchema } from "./deployment-checks";
 import {
   STACK_IDS,
+  RUNTIME_VERSION_PATTERN,
+  RUNTIME_VERSION_MAX_LENGTH,
   ALL_PACKAGE_MANAGERS,
   ALL_RESOURCE_TIERS,
   PROXY_DIRECTIVES,
@@ -16,6 +19,13 @@ import {
 } from "@repo/core";
 
 // ─── Shared enums (derived from registry) ────────────────────────────────────
+
+export const RuntimeVersionSchema = Type.String({
+  pattern: RUNTIME_VERSION_PATTERN,
+  maxLength: RUNTIME_VERSION_MAX_LENGTH,
+  description: "Runtime version; supported versions and images are validated for the selected stack.",
+});
+export const OptionalRuntimeVersionSchema = Type.Optional(Type.Union([RuntimeVersionSchema, Type.Null()]));
 
 export const FrameworkEnum = Type.String({
   maxLength: 100,
@@ -131,6 +141,11 @@ const PublicEndpointSchema = Type.Object({
  * empty one rather than fall back to repo root by accident.
  */
 const MonorepoAppSchema = Type.Object({
+  publicEndpoints: Type.Optional(
+    Type.Array(Type.Pick(PublicEndpointSchema, ["port", "domain", "customDomain", "domainType"]), {
+      maxItems: 50,
+    }),
+  ),
   name: Type.String({ minLength: 1, maxLength: 100 }),
   // Spread first, then override rootDirectory to required. The shared
   // block has it Optional to match the DB column; this create payload
@@ -221,6 +236,30 @@ const RoutingRuleSchema = Type.Object({
   source: Type.String({ maxLength: 2000 }),
   destination: Type.String({ maxLength: 2000 }),
 });
+
+/** Shape only; the rules (DNS-label names, singleton vs replicas, ...) come from core's `parseOpenshipConfig`. */
+const RoleHealthSchema = Type.Object(
+  {
+    kind: Type.Union([Type.Literal("http"), Type.Literal("exec"), Type.Literal("process")]),
+    path: Type.Optional(Type.String({ maxLength: 500 })),
+    command: Type.Optional(Type.String({ maxLength: 1000 })),
+  },
+  { additionalProperties: false },
+);
+
+export const RoleSchema = Type.Object(
+  {
+    name: Type.String({ minLength: 1, maxLength: 63 }),
+    kind: Type.Union([Type.Literal("worker"), Type.Literal("scheduler")]),
+    command: Type.String({ minLength: 1, maxLength: 1000 }),
+    replicas: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+    singleton: Type.Optional(Type.Boolean()),
+    health: Type.Optional(RoleHealthSchema),
+    stopSignal: Type.Optional(Type.String({ maxLength: 32 })),
+    stopGracePeriod: Type.Optional(Type.String({ maxLength: 32 })),
+  },
+  { additionalProperties: false },
+);
 
 /**
  * Openship's deploy-time readiness gate — mirrors `OpenshipReadiness` in
@@ -340,6 +379,7 @@ export const SetReleaseSourceBody = Type.Object({
 });
 
 export const CreateProjectBody = Type.Object({
+  githubChecks: Type.Optional(Type.Union([GitHubDeploymentChecksSchema, Type.Null()])),
   name: Type.String({ minLength: 1, maxLength: 100 }),
   /**
    * Durable deploy-target binding for a newly created project. The generic
@@ -400,7 +440,15 @@ export const CreateProjectBody = Type.Object({
   releaseCommands: Type.Optional(
     Type.Union([Type.Null(), Type.Array(Type.String({ maxLength: 1000 }), { maxItems: 20 })]),
   ),
+  /**
+   * Extra processes (queue workers, a scheduler) run from the same built image
+   * as the web app. Omit to keep the current value; `null` or `[]` = no roles.
+   * Mirrors `openship.json`'s `roles`.
+   */
+  roles: Type.Optional(Type.Union([Type.Null(), Type.Array(RoleSchema, { maxItems: 20 })])),
   buildImage: Type.Optional(Type.String({ maxLength: 200 })),
+  runtimeVersion: OptionalRuntimeVersionSchema,
+  runtimeImage: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 200, description: "Custom production base image for generated Docker builds; null restores the stack default." }), Type.Null()])),
   productionMode: Type.Optional(
     Type.Union([Type.Literal("host"), Type.Literal("static"), Type.Literal("standalone")]),
   ),
@@ -458,6 +506,8 @@ export const CreateProjectBody = Type.Object({
       Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 50 }),
     ]),
   ),
+  /** Static delivery on managed Cloud; ignored on other deployment targets. */
+  cloudStaticHosting: Type.Optional(Type.Union([Type.Literal("pages"), Type.Literal("server")])),
   /** Routing config from the repo's vercel.json (see RoutingConfigSchema). */
   routingConfig: Type.Optional(Type.Union([Type.Null(), RoutingConfigSchema])),
   /**
@@ -663,6 +713,7 @@ export const SetSleepModeBody = Type.Object({
  */
 export const SetOptionsBody = Type.Object(
   {
+    githubChecks: CreateProjectBody.properties.githubChecks,
     /** Save a scanned source ref and its build settings in the same update. */
     gitBranch: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
     buildCommand: Type.Optional(Type.String()),
@@ -679,9 +730,13 @@ export const SetOptionsBody = Type.Object(
     startCommand: Type.Optional(Type.String()),
     /** Deploy-time release commands; `null`/`[]` turns the release phase off. */
     releaseCommands: EnsureProjectBody.properties.releaseCommands,
+    /** Runtime roles; `null`/`[]` clears them. */
+    roles: EnsureProjectBody.properties.roles,
     productionPort: Type.Optional(Type.Union([Type.Number(), Type.String()])),
     packageManager: Type.Optional(Type.String()),
     buildImage: Type.Optional(Type.String()),
+    runtimeVersion: OptionalRuntimeVersionSchema,
+  runtimeImage: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 200, description: "Custom production base image for generated Docker builds; null restores the stack default." }), Type.Null()])),
     framework: Type.Optional(Type.String()),
     productionMode: Type.Optional(Type.String({ description: "host | static | standalone." })),
     hasServer: Type.Optional(Type.Boolean()),

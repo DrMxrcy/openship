@@ -26,6 +26,7 @@
   }
   .topology-actions {
     flex: 1;
+    flex-wrap: wrap;
   }
   .topology-add-service {
     flex: 1;
@@ -41,6 +42,9 @@
   /* Keep the canvas grid behind translucent selection surfaces. */
   background: var(--th-card-on-page);
   border-radius: 1rem;
+}
+.topology-workspace .react-flow__node-resource.topology-replica-group {
+  background: transparent;
 }
 .topology-notice {
   top: 16px;
@@ -66,20 +70,20 @@
   background: var(--scale-node-tint);
   color: var(--scale-node-color);
 }
-.topology-node .react-flow__handle {
+.topology-port.react-flow__handle {
   width: 9px;
   height: 9px;
   border: 2px solid var(--th-card-on-page);
   background: var(--muted-foreground);
 }
-.topology-node .react-flow__handle::after {
+.topology-port.react-flow__handle::after {
   content: "";
   position: absolute;
   inset: -7px;
 }
-.topology-node .react-flow__handle:hover,
-.topology-node .react-flow__handle.connectingto {
-  background: var(--scale-node-color);
+.topology-port.react-flow__handle:hover,
+.topology-port.react-flow__handle.connectingto {
+  background: var(--scale-node-color, var(--foreground));
 }
 .topology-canvas-controls {
   background: var(--background);
@@ -88,7 +92,8 @@
 .topology-status {
   color: var(--muted-foreground);
 }
-.topology-status[data-state="running"] {
+.topology-status[data-state="running"],
+.topology-status[data-state="succeeded"] {
   color: var(--success);
 }
 .topology-status[data-state="starting"],

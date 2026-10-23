@@ -1,3 +1,4 @@
+import { env } from "../config/env";
 /**
  * SSH Connection Manager - per-server cached executors with idle-TTL.
  *
@@ -25,6 +26,7 @@
  *   - Timers use unref() so they don't prevent graceful shutdown.
  */
 
+import { observedAllSettled, reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { readFileSync } from "node:fs";
 import { repos } from "@repo/db";
 import {
@@ -46,6 +48,7 @@ import { formatDuration, systemDebug } from "./system-debug";
 import { decryptSecretField } from "./credential-encryption";
 import { operatorSshKeyRoots, resolveSafeSshKeyPath } from "./ssh-key-path";
 import { isLocalHostRow } from "./box-org";
+import { assertOperatorSshAccess } from "./operator-ssh-access";
 import { assertSshDestination, normalizeSshTransport, parseSshTuningArgs, safeErrorMessage } from "@repo/core";
 import { assertNativeSshSettings } from "../native/execution-policy";
 import { resolvePinnedHost } from "./ssrf-guard";
@@ -55,6 +58,7 @@ import { AppError } from "@repo/core";
 
 /** Settings shape accepted by `buildSshConfig`. */
 export interface SshSettingsInput {
+  organizationId?: string | null;
   purpose?: string;
   sshHostKey?: string | null;
   sshHost: string | null;
@@ -80,10 +84,11 @@ export interface SshSettingsInput {
  */
 export async function buildSshConfig(
   settings: SshSettingsInput,
-  options?: { trustOnFirstUse: (key: Buffer) => boolean },
+  options?: { trustOnFirstUse?: (key: Buffer) => boolean; localBootstrap?: boolean },
 ): Promise<SshConfig | null> {
   if (!settings.sshHost) return null;
   assertNativeSshSettings(settings);
+  await assertOperatorSshAccess(settings, settings.organizationId, options?.localBootstrap);
 
   const config: SshConfig = {
     host: settings.sshHost,
@@ -99,13 +104,13 @@ export async function buildSshConfig(
   assertSshDestination(config);
   parseSshTuningArgs(config.sshArgs);
 
-  if (settings.purpose === "migration_source") {
+  if (env.CLOUD_MODE || settings.purpose === "migration_source") {
     // These are customer-owned sources reached by the SaaS, never operator SSH
     // configuration. Pin the actual dial address on EVERY reconnect (no DNS TOCTOU).
     if (transport !== "direct" || settings.sshKeyPath || settings.sshJumpHost || settings.sshArgs ||
         !["password", "key"].includes(settings.sshAuthMethod ?? "") ||
         (!settings.sshHostKey && !options?.trustOnFirstUse)) {
-      throw new AppError("Migration sources require direct SSH with a password or uploaded private key", 400, "INVALID_MIGRATION_CONNECTION");
+      throw new AppError("Customer-owned servers require direct SSH with a password or uploaded private key", 400, "INVALID_MIGRATION_CONNECTION");
     }
     config.host = (await resolvePinnedHost(settings.sshHost)).ip;
     config.hostVerifier = settings.sshHostKey
@@ -137,13 +142,15 @@ export async function buildSshConfig(
         keyPath = resolveSafeSshKeyPath(settings.sshKeyPath!, {
           extraRoots: operatorSshKeyRoots(),
         });
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "platform/engine/lib/ssh-manager");
         return null;
       }
 
       try {
         config.privateKey = readFileSync(keyPath, "utf-8");
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "platform/engine/lib/ssh-manager");
         return null;
       }
     }
@@ -421,6 +428,16 @@ export class SshConnectionManager {
   async acquire(serverId: string): Promise<CommandExecutor> {
     const startedAt = Date.now();
     if (this.destroyed) throw new Error("SshManager has been destroyed");
+    if (env.CLOUD_MODE) {
+      const server = await repos.server.get(serverId);
+      if (!server) throw new AppError("Server not found", 404, "SERVER_NOT_FOUND");
+      // Includes pooled connections and background jobs. Saved import-only
+      // connections retain their separate, explicitly scoped migration flow.
+      if (server.purpose !== "migration_source") {
+        const { assertServerExecution } = await import("../modules/system/server-access");
+        await assertServerExecution(server);
+      }
+    }
 
     // A row we've ALREADY classified as this host resolves to the shared channel
     // directly — BEFORE the generic cache fast-path below. That path returns the
@@ -449,7 +466,7 @@ export class SshConnectionManager {
     // API is containerized `createHostExecutor()` builds a NEW SshExecutor to the
     // host every call, so an unpooled path leaked one sshd session per call —
     // 8,000+ in hours, then OOM (#291). Every local row shares the one host channel.
-    const row = await repos.server.get(serverId).catch(() => undefined);
+    const row = await repos.server.get(serverId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/lib/ssh-manager"); return undefined; });
     if (row && (await isLocalHostRow(row))) {
       return this.acquireLocalHost(serverId, startedAt);
     }
@@ -766,7 +783,8 @@ export class SshConnectionManager {
         return this.acquire(serverId);
       }
       if (connection.idleTimer) clearTimeout(connection.idleTimer);
-      try { connection.unsubDisconnect?.(); } catch { /* best-effort */ }
+      try { connection.unsubDisconnect?.(); } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "platform/engine/lib/ssh-manager"); /* best-effort */ }
       this.retired.set(observed, key);
       this.cacheConnection(key, fresh);
       if (key === HOST_CHANNEL_KEY) {
@@ -914,7 +932,6 @@ export class SshConnectionManager {
    */
   async diagnoseReachability(serverId: string, timeoutMs = 2500): Promise<ReachabilityDiagnosis> {
     if (this.destroyed) return { reachable: false, code: "unknown" };
-    if (this.isConnected(serverId)) return { reachable: true, code: "ok" };
 
     // Read the cooldown BEFORE the row so a remote box in cooldown still pays no
     // probe; the row read that follows is a local DB hit, and it's what decides
@@ -922,8 +939,14 @@ export class SshConnectionManager {
     // host-channel health, whose cooldown path still has to carry the REASON.
     const inCooldown = this.cooldownRemaining(serverId) > 0;
 
-    const server = await repos.server.get(serverId).catch(() => undefined);
+    const server = await repos.server.get(serverId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/lib/ssh-manager"); return undefined; });
     if (!server) return { reachable: false, code: "unknown" };
+    if (env.CLOUD_MODE && server.purpose !== "migration_source") {
+      const { assertServerExecution } = await import("../modules/system/server-access");
+      await assertServerExecution(server);
+    }
+    // A cached connection proves reachability, never ongoing authorization.
+    if (this.isConnected(serverId)) return { reachable: true, code: "ok" };
 
     // An isLocal row is THIS box (the auto-registered "This Server"). Its ssh*
     // fields are display-only — self-server.ts writes `127.0.0.1`/SERVER_IP purely
@@ -983,11 +1006,18 @@ export class SshConnectionManager {
         await this.withExecutor(serverId, executor => executor.exec("true", { timeout: timeoutMs }));
         return { reachable: true, code: "ok" };
       } catch (error) {
+        observeCaughtError(error, "platform/engine/lib/ssh-manager");
         return { reachable: false, code: "unreachable", hint: safeErrorMessage(error) };
       }
     }
 
-    const ok = await probeTcp(host, port, timeoutMs);
+    // Apply the same destination policy as SSH on every new dial. Passing the
+    // validated address (not the hostname) prevents a second DNS lookup rebinding
+    // this diagnostic to the SaaS control plane or its private network.
+    const dialHost = env.CLOUD_MODE || server.purpose === "migration_source"
+      ? (await resolvePinnedHost(host)).ip
+      : host;
+    const ok = await probeTcp(dialHost, port, timeoutMs);
     if (ok) this.recordSuccess(serverId);
     else this.recordFailure(serverId);
     return { reachable: ok, code: ok ? "ok" : "unreachable", ...endpoint };
@@ -1132,7 +1162,8 @@ export class SshConnectionManager {
     for (const conn of this.servers.values()) {
       if (conn.idleTimer) clearTimeout(conn.idleTimer);
       if (conn.unsubDisconnect) {
-        try { conn.unsubDisconnect(); } catch { /* best-effort */ }
+        try { conn.unsubDisconnect(); } catch (diagnosticFailure) {
+          observeCaughtError(diagnosticFailure, "platform/engine/lib/ssh-manager"); /* best-effort */ }
       }
       executors.add(conn.executor);
     }
@@ -1140,15 +1171,16 @@ export class SshConnectionManager {
     this.retainCounts.clear();
     this.retired.clear();
 
-    await Promise.allSettled(
-      [...executors].map((exec) => this.disposeBounded(exec, disposeTimeoutMs)),
+    await observedAllSettled(
+      [...executors].map((exec) => this.disposeBounded(exec, disposeTimeoutMs)), "platform/engine/lib/ssh-manager",
     );
   }
 
   /** Dispose an executor, resolving after `timeoutMs` even if it hangs. */
   private disposeBounded(exec: CommandExecutor, timeoutMs: number): Promise<void> {
     if (!("dispose" in exec) || typeof exec.dispose !== "function") return Promise.resolve();
-    const disposed = Promise.resolve(exec.dispose()).catch(() => { /* teardown is best-effort */ });
+    const disposed = Promise.resolve(exec.dispose()).catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "platform/engine/lib/ssh-manager"); /* teardown is best-effort */ });
     const timeout = new Promise<void>((resolve) => {
       const t = setTimeout(resolve, timeoutMs);
       if (typeof t.unref === "function") t.unref();
@@ -1196,6 +1228,7 @@ export class SshConnectionManager {
           q.ops.shift();
           op.resolve(result);
         } catch (err) {
+          observeCaughtError(err, "platform/engine/lib/ssh-manager");
           q.ops.shift();
           op.reject(err instanceof Error ? err : new Error(safeErrorMessage(err)));
         }
@@ -1327,7 +1360,8 @@ export class SshConnectionManager {
 
     if (conn.idleTimer) clearTimeout(conn.idleTimer);
     if (conn.unsubDisconnect) {
-      try { conn.unsubDisconnect(); } catch { /* best-effort */ }
+      try { conn.unsubDisconnect(); } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "platform/engine/lib/ssh-manager"); /* best-effort */ }
     }
     this.retainCounts.delete(serverId);
     // A BORROWED entry (a local row pointing at the shared host channel) must only

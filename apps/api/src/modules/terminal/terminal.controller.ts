@@ -27,7 +27,9 @@
  *           code, signal } | { type: "error", code, message } | { type: "pong" }
  */
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import type { Context } from "hono";
+import { trackBackgroundWork } from "@repo/platform/engine/lib/background-work";
 import {
   TERMINAL_SUBPROTOCOL_PREFIX as SUBPROTOCOL_PREFIX,
   TERMINAL_RESUME_SUBPROTOCOL_PREFIX as RESUME_SUBPROTOCOL_PREFIX,
@@ -36,7 +38,6 @@ import {
 import { openServerShell } from "@repo/platform/engine/lib/server-execution";
 import { prepareCloudTerminal, cloudTerminalHandlers } from "../../lib/cloud/terminal-bridge";
 import { createProvisionLock } from "@repo/platform/engine/lib/provision-lock";
-import { auth } from "@repo/platform/engine/lib/auth";
 import { env, trustedOrigins } from "@repo/platform/engine/config/env";
 import { upgradeWebSocket } from "../../lib/ws";
 import { repos } from "@repo/db";
@@ -56,8 +57,10 @@ import {
   unregisterSession,
 } from "../../lib/terminal-session-manager";
 import { getRequestContext } from "../../lib/request-context";
-import { resolveActiveOrganizationId } from "../../middleware/active-organization";
-import { permission, checkPermission } from "../../lib/permission";
+import { resolveTerminalContext, watchTerminalAuthorization } from "../../lib/terminal-authorization";
+import { permission } from "../../lib/permission";
+import { authorization } from "@repo/platform/engine/lib/authorization";
+import type { ExecutionContext } from "@repo/platform";
 import {
   safeWsSend,
   safeWsClose,
@@ -116,7 +119,7 @@ type ErrorCode =
 export async function issueTicket(c: Context) {
   const ctx = getRequestContext(c);
 
-  const body = await c.req.json().catch(() => ({}));
+  const body = await c.req.json().catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller"); return ({}); });
   const serverId = typeof body?.serverId === "string" ? body.serverId : "";
   if (!serverId) return c.json({ error: "serverId required" }, 400);
   const cloud = await prepareCloudTerminal(ctx, "server", serverId);
@@ -184,59 +187,24 @@ export const terminalWsHandler = upgradeWebSocket(async (c) => {
   // Only used when no ticket was presented. Browsers WILL send cookies
   // on a same-origin WS upgrade, but we still prefer the ticket because
   // it binds (userId, serverId) together.
-  let userId: string | null = null;
-  let ticketServerId: string | null = null;
-  // Resolve activeOrganizationId here — the WS upgrade route deliberately
-  // skips the HTTP authMiddleware (auth happens inside this factory), so
-  // it's not pre-set on the Hono context. Two paths, mirroring the
-  // sibling service-terminal controller:
-  //   - Ticket path: the ticket carries (userId, orgId, serverId) baked
-  //     in at mint time, when authMiddleware HAD resolved the org. Use
-  //     that org — re-deriving it here would scope the socket to a
-  //     different tenant than the one the mint-time checks passed in.
-  //   - Cookie path: no ticket, so re-derive from the session through
-  //     resolveActiveOrganizationId (the canonical resolver from
-  //     middleware/active-organization.ts), applying the same
-  //     team-org-preferred + memberships[0] fallback as every other
-  //     authed request.
-  // Foreground non-WS callers must NOT duplicate this pattern — they
-  // read ctx.organizationId, which authMiddleware already populated.
-  let activeOrgId: string | null = null;
-  if (ticket) {
-    userId = ticket.userId;
-    ticketServerId = ticket.serverId;
-    activeOrgId = ticket.organizationId;
-  } else {
-    try {
-      const session = await auth.api.getSession({ headers: c.req.raw.headers });
-      if (session?.user?.id) {
-        userId = session.user.id;
-        const sessOrgId =
-          (session.session as { activeOrganizationId?: string | null } | null)
-            ?.activeOrganizationId ?? null;
-        activeOrgId = await resolveActiveOrganizationId(userId, sessOrgId).catch(() => null);
-      }
-    } catch {
-      // fall through to reject below
-    }
+  let actor;
+  try {
+    actor = await resolveTerminalContext(c.req.raw.headers, ticket?.context);
+  } catch (error) {
+    observeCaughtError(error, "api/lib/terminal-authorization");
+    return openInitFailure("ssh_auth", "Unauthorized", 4401);
   }
-  if (!userId) return openInitFailure("ssh_auth", "Unauthorized", 4401);
-  if (!activeOrgId) return openInitFailure("ssh_auth", "No active organization", 4401);
+  const { userId, organizationId: activeOrgId } = actor;
 
   // ── 3. Server existence + path-binding sanity ──────────────────────────
   const pathServerId = c.req.param("serverId");
   if (!pathServerId) return openInitFailure("server_not_found", "serverId required", 4400);
   // If we authenticated via ticket, ensure the ticket's serverId matches
   // the path - prevents a ticket for server A being replayed against B.
-  if (ticketServerId && ticketServerId !== pathServerId) {
+  if (ticket && ticket.serverId !== pathServerId) {
     return openInitFailure("ssh_auth", "Ticket / path mismatch", 4401);
   }
-  // Primary gate: opening a PTY is administrative. We call the pure
-  // resolver (no Hono context) directly here because the WS upgrade path
-  // resolves userId + activeOrgId manually above (authMiddleware is
-  // bypassed for the upgrade). 404-shape on deny via openInitFailure so
-  // we don't leak existence to non-admins.
-  const allowed = await checkPermission(userId, activeOrgId, {
+  const allowed = await authorization.checkPermissionOnResource(actor, {
     resourceType: "server",
     resourceId: pathServerId,
     action: "admin",
@@ -245,7 +213,7 @@ export const terminalWsHandler = upgradeWebSocket(async (c) => {
     return openInitFailure("server_not_found", "Server not found", 4404);
   }
   if (ticket?.cloud) return cloudTerminalHandlers({ kind: "server", id: pathServerId,
-    userId, organizationId: activeOrgId, cloud: ticket.cloud, resumeToken });
+    context: ticket.context, cloud: ticket.cloud, resumeToken });
   // Org-scoped lookup: returns 404 indistinguishably whether the server
   // doesn't exist or belongs to a different org. This is the cross-tenant
   // host-shell gate (defense in depth alongside the permission check above).
@@ -275,6 +243,7 @@ export const terminalWsHandler = upgradeWebSocket(async (c) => {
   // ── 6. Open the PTY (lazy — happens in onOpen so the failure path
   //       can send a structured error frame before close) ────────────────
   const ctx: HandshakeCtx = {
+    actor: ticket?.context ?? actor,
     userId,
     serverId: pathServerId,
     organizationId: activeOrgId,
@@ -292,6 +261,7 @@ export const terminalWsHandler = upgradeWebSocket(async (c) => {
 // ─── Per-connection state container ─────────────────────────────────────────
 
 interface HandshakeCtx {
+  actor: ExecutionContext;
   userId: string;
   organizationId: string;
   managed?: boolean;
@@ -309,6 +279,7 @@ export interface ConnState {
   shell: ShellSession | null;
   ws: WSLike | null;
   heartbeatTimer: ReturnType<typeof setInterval> | null;
+  stopAuthorizationWatch?: () => void;
   /** True when this WebSocket connection has detached; stops its data pump and incoming messages. */
   closed: boolean;
   /** True when this connection's session has been fully ended (shell killed, audit row closed). */
@@ -339,6 +310,15 @@ function buildHandlers(ctx: HandshakeCtx) {
     ended: false,
     userTerminated: false,
   };
+
+  function watchAuthorization(ws: WSLike) {
+    state.stopAuthorizationWatch = watchTerminalAuthorization(ctx.actor, { resourceType: "server", resourceId: ctx.serverId }, () => {
+      sendControl(ws, { type: "error", code: "ssh_auth", message: "Terminal authorization expired. Reconnect to continue." });
+      state.userTerminated = true;
+      safeWsClose(ws, 4401, "authorization_expired");
+      void teardown(state, "client_close", null, false, true);
+    });
+  }
 
   return {
     /**
@@ -409,6 +389,7 @@ function buildHandlers(ctx: HandshakeCtx) {
           sendControl(ws, { type: "pong" });
         }, HEARTBEAT_INTERVAL_MS);
         (state.heartbeatTimer as { unref?: () => void }).unref?.();
+        watchAuthorization(ws);
 
         sendControl(ws, {
           type: "ready",
@@ -437,7 +418,8 @@ function buildHandlers(ctx: HandshakeCtx) {
           return;
         }
         auditId = row.id;
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller");
         sendControl(ws, { type: "error", code: "server_error", message: "Could not reserve a terminal session. Retry to reconnect." });
         safeWsClose(ws, 1011, "server_error");
         return;
@@ -449,7 +431,10 @@ function buildHandlers(ctx: HandshakeCtx) {
       try {
         ({ shell, release } = await openServerShell(ctx.organizationId, ctx.serverId, { cols: 80, rows: 24, term: "xterm-256color" }));
       } catch (err: any) {
-        await repos.terminalSession.close(auditId, { exitReason: "server_error" }).catch(() => {});
+        observeCaughtError(err, "api/modules/terminal/terminal.controller");
+        await repos.terminalSession.close(auditId, { exitReason: "server_error" }).catch((diagnosticFailure) => {
+          observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller");
+        });
         const code: ErrorCode = ctx.managed ? "server_error" : classifySshError(err);
         sendControl(ws, { type: "error", code, message: err?.message || "Server connection failed" });
         safeWsClose(ws, 1011, code);
@@ -516,6 +501,7 @@ function buildHandlers(ctx: HandshakeCtx) {
         sendControl(ws, { type: "pong" });
       }, HEARTBEAT_INTERVAL_MS);
       (state.heartbeatTimer as { unref?: () => void }).unref?.();
+      watchAuthorization(ws);
 
       sendControl(ws, {
         type: "ready",
@@ -630,14 +616,19 @@ function writeStdin(state: ConnState, buf: Buffer): void {
  * still close the DB row. Stale handlers from a previous WS (e.g. after a
  * resume) are rejected by the `state.closed && !alreadyUnregistered` guard.
  */
-export async function teardown(
+export function teardown(
   state: ConnState,
   reason: TerminalExitReason,
   exitCode: number | null,
   alreadyUnregistered = false,
   forceClose = true,
 ) {
+  return trackBackgroundWork(teardownConnection(state, reason, exitCode, alreadyUnregistered, forceClose));
+}
+
+async function teardownConnection(state: ConnState, reason: TerminalExitReason, exitCode: number | null, alreadyUnregistered: boolean, forceClose: boolean) {
   // Full teardown already completed for this connection.
+  state.stopAuthorizationWatch?.();
   if (state.ended) return;
 
   // The WS side of this connection is already gone and this is not the
@@ -692,7 +683,8 @@ export async function teardown(
         exitCode,
         exitReason: reason,
       });
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "api/modules/terminal/terminal.controller");
       // Admission expires rows past the hard cap on Cloud; self-hosted
       // startup also sweeps rows abandoned by a previous process.
     }

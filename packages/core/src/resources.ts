@@ -12,6 +12,8 @@
  *      64 GB; the old fixed 8192 MB / 4-core cap made that impossible.
  */
 
+import { AppError } from "./errors";
+
 /** Preset limits, a custom limit, or the full available server capacity. */
 export type ResourceTier = "unlimited" | "micro" | "low" | "medium" | "high" | "xlarge" | "custom";
 
@@ -25,6 +27,24 @@ export interface ResourceValues {
   memoryMb: number;
   /** Writable disk in MB. Only cloud workspaces enforce this. */
   diskMb: number;
+}
+
+/** Swap is a service/container option, not a project or VM capacity dimension.
+ * Explicit zero overrides inherited memory and cannot disable swap. */
+export function validateSwapDisabled(
+  resources?: { memoryMb?: number; swapDisabled?: boolean } | null,
+  inherited?: { memoryMb?: number } | null,
+): void {
+  if (
+    resources?.swapDisabled === true &&
+    !hasMemoryLimit({ memoryMb: resources.memoryMb ?? inherited?.memoryMb })
+  ) {
+    throw new AppError(
+      "Disabling swap requires a positive memory limit. Set a memory limit on the service or its project, then try again.",
+      400,
+      "SWAP_DISABLED_REQUIRES_MEMORY_LIMIT",
+    );
+  }
 }
 
 /** No additional container cap — the server is the default ceiling. */
@@ -73,6 +93,37 @@ export interface HostCapacity {
   memoryMb: number;
   /** Where the numbers came from, for UI disclosure and debugging. */
   source: "docker" | "local" | "unknown";
+  /**
+   * The daemon has an `nvidia` container runtime (the NVIDIA Container Toolkit is installed and
+   * registered). This is what a GPU container needs, and it is what Docker `/info` reports without any
+   * shell on the host. It does NOT prove a card is installed, so it is a probe signal, not a count.
+   */
+  gpuRuntime?: boolean;
+  /**
+   * GPUs the daemon itself lists (Docker >= 28 `DiscoveredDevices`, CDI `nvidia.com/gpu=N`). Absent =
+   * not known, which is NOT the same as 0: an older daemon lists nothing even with a card present.
+   */
+  gpuCount?: number;
+}
+
+/** How a server's GPU status was decided. */
+export type GpuOverride = "yes" | "no" | null;
+
+/**
+ * Final answer to "does this server have a GPU?" — the manual mark wins over the probe in BOTH
+ * directions. `"yes"` is for a box whose probe cannot see the card (a runtime that is not registered
+ * yet, nvidia-smi missing from PATH); `"no"` is for hiding a card the operator reserves for the host.
+ * `null`/absent follows the probe.
+ */
+export function effectiveGpu(
+  capacity: Pick<HostCapacity, "gpuRuntime" | "gpuCount"> | null | undefined,
+  override?: GpuOverride | undefined,
+): { hasGpu: boolean; count: number | null; source: "override" | "probe" | "none" } {
+  const count = capacity?.gpuCount ?? null;
+  if (override === "yes") return { hasGpu: true, count, source: "override" };
+  if (override === "no") return { hasGpu: false, count: null, source: "override" };
+  const seen = capacity?.gpuRuntime === true || count !== null;
+  return seen ? { hasGpu: true, count, source: "probe" } : { hasGpu: false, count: null, source: "none" };
 }
 
 /** Project resource settings returned by the API and consumed by the dashboard. */

@@ -1,3 +1,4 @@
+import { managementBillingRoutes } from "./management-billing.routes";
 /**
  * Local billing proxy — runs only when !CLOUD_MODE.
  *
@@ -17,10 +18,11 @@ import { BillingOperationSchemas, CreateSubscriptionBody, CreateTopupBody } from
 import { authMiddleware } from "../../middleware";
 import { billingPlanChangeRoutes } from "./billing-plan-change.routes";
 import { billingCheckoutRoutes } from "./billing-checkout.routes";
+import { actionsBillingRoutes } from "./actions-billing.routes";
 import { secureRouter } from "../../lib/secure-router";
 import * as billingLocal from "./billing.controller";
 
-export const billingLocalRoutes = new Hono().route("/", billingPlanChangeRoutes).route("/", billingCheckoutRoutes);
+export const billingLocalRoutes = new Hono().route("/", managementBillingRoutes).route("/", billingPlanChangeRoutes).route("/", billingCheckoutRoutes).route("/", actionsBillingRoutes);
 const r = secureRouter(billingLocalRoutes, {
   module: "billing-local",
   basePath: "/api/billing",

@@ -1,8 +1,12 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
+import { managedNodeEnvironment } from "./node-listener";
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
 import type { Oblien } from "oblien";
 import { AppError, SYSTEM, safeErrorMessage, isHostPathSource } from "@repo/core";
 import { DockerRuntime } from "../docker";
+import { imageVolumeName } from "../docker-image-volumes";
+import { BareRuntime } from "../bare";
 import { CloudServerConnection } from "./server-connection";
 import { CloudProcessSupervisor } from "./process-supervisor";
 import { managedProjectRoutingScope, type ManagedContainerRouteTargets } from "./routing-scope";
@@ -21,6 +25,7 @@ import type {
   MultiServiceDeployConfig,
   MultiServiceDeployResult,
   MultiServiceGroupHandle,
+  RuntimeCapability,
 } from "../types";
 import { CloudWorkspaceExecutor } from "./workspace-executor";
 import { CLOUD_DOCKER_BRIDGE_PORT } from "./docker-bridge-source";
@@ -32,9 +37,8 @@ import {
   waitForCloudDockerWorkspace,
 } from "./workspace-ready";
 import { cloudDockerProjectPaths } from "./docker-paths";
-import { ensureCloudProjectVolume } from "./docker-volume";
-import { prepareManagedSource } from "./source";
-import { scopeVolumeBinds } from "../volume-namespace";
+import { ensureCloudProjectVolume, resolveCloudProjectVolumeName } from "./docker-volume";
+import { prepareRemoteSource } from "../remote-source";
 import { pickHostPort } from "../host-port";
 import { scanPorts } from "../../system/port-scan";
 export { CLOUD_SERVER_IMAGE as CLOUD_DOCKER_IMAGE } from "./server-connection";
@@ -51,6 +55,7 @@ export interface CloudDockerOptions {
   /** Explicit opt-in for a desktop/self-hosted source transfer; SaaS denies it. */
   allowHostSource?: boolean;
   provisionLock: ProvisionLock;
+  buildCacheProtection?: import("../docker").DockerConnectionOptions["buildCacheProtection"];
   bridgeLock?: ProvisionLock;
   resolveRegistryAuth: (ref: string) => Promise<DockerRegistryAuth | undefined>;
 }
@@ -65,6 +70,10 @@ function notFound(error: unknown): boolean {
  * stays explicit: container IDs identify containers; workspaceId identifies the
  * shared host. Inherited retention/rollback never stop or delete that host. */
 export class CloudDockerRuntime extends DockerRuntime {
+  // Managed cloud refuses role containers for now; every other Docker capability is kept.
+  override readonly capabilities: ReadonlySet<RuntimeCapability> = new Set(
+    DockerRuntime.CAPABILITIES.filter(cap => cap !== "roles"),
+  );
   readonly workspaceId: string;
   readonly projectId: string;
   readonly executor: CloudWorkspaceExecutor;
@@ -84,6 +93,7 @@ export class CloudDockerRuntime extends DockerRuntime {
         executor,
         cloudConnection: () => connection.connectDocker(),
         resolveRegistryAuth: options.resolveRegistryAuth,
+        buildCacheProtection: options.buildCacheProtection,
       },
       null,
       options.provisionLock,
@@ -185,15 +195,45 @@ export class CloudDockerRuntime extends DockerRuntime {
     return id;
   }
   override async removeNetwork(slug: string) {
-    try {
-      const network = await this.docker.getNetwork(`openship-${slug}`).inspect();
-      if (network.Labels?.["openship.project"] !== this.projectId)
-        throw new AppError("Network belongs to another project", 409, "CLOUD_NETWORK_CONFLICT");
-    } catch (error) {
-      if (notFound(error)) return;
-      throw error;
-    }
-    return super.removeNetwork(slug);
+    return this.removeScopedNetwork(slug, "strict");
+  }
+  /** A slug retained after migration can now name another project's network.
+   * Cleanup leaves a proven foreign owner alone; unknown ownership still fails. */
+  async removeProjectNetwork(slug: string): Promise<void> {
+    return this.removeScopedNetwork(slug, "project-cleanup");
+  }
+  private async removeScopedNetwork(
+    slug: string,
+    mode: "strict" | "project-cleanup",
+  ): Promise<void> {
+    return this.options.provisionLock.run(async () => {
+      try {
+        const network = await this.docker.getNetwork(`openship-${slug}`).inspect();
+        const owner = network.Labels?.["openship.project"];
+        if (owner !== this.projectId) {
+          if (
+            mode === "project-cleanup" &&
+            typeof owner === "string" &&
+            owner.length > 0 &&
+            owner.trim() === owner
+          )
+            return;
+          throw new AppError("Network belongs to another project", 409, "CLOUD_NETWORK_CONFLICT");
+        }
+        if (typeof network.Id !== "string" || !/^[a-f0-9]{64}$/.test(network.Id))
+          throw new AppError(
+            "Could not verify the network identity",
+            409,
+            "CLOUD_NETWORK_CONFLICT",
+          );
+        // Network names are reusable. Removing the inspected ID cannot target a
+        // replacement created with the same name after the ownership read.
+        await this.docker.getNetwork(network.Id).remove();
+      } catch (error) {
+        if (notFound(error)) return;
+        throw error;
+      }
+    });
   }
   override async listProjectContainerIds(id: string) {
     this.assertProject(id);
@@ -218,6 +258,9 @@ export class CloudDockerRuntime extends DockerRuntime {
     if (owner && owner !== this.projectId)
       throw new AppError("Image belongs to another project", 404, "IMAGE_NOT_FOUND");
     return image;
+  }
+  protected override async inspectDeploymentImage(ref: string) {
+    return this.accessibleImage(ref);
   }
   override async removeImage(ref: string) {
     try {
@@ -298,13 +341,27 @@ export class CloudDockerRuntime extends DockerRuntime {
     return super.removeVolume(name);
   }
   private async ownedVolumeBinds(slug: string, volumes: string[]) {
-    const scoped = scopeVolumeBinds(slug, volumes, true);
-    for (const spec of scoped) {
-      const source = spec.split(":")[0]!;
-      if (isHostPathSource(source)) continue;
-      await ensureCloudProjectVolume(this.docker, source, this.projectId);
+    const scoped: string[] = [];
+    for (const spec of volumes) {
+      const parts = spec.split(":");
+      if (parts.length > 1 && !isHostPathSource(parts[0]!)) {
+        parts[0] = await resolveCloudProjectVolumeName(
+          this.docker,
+          this.projectId,
+          slug,
+          parts[0]!,
+        );
+        await ensureCloudProjectVolume(this.docker, parts[0], this.projectId);
+      }
+      scoped.push(parts.join(":"));
     }
     return scoped;
+  }
+  protected override async serviceVolumeBinds(config: MultiServiceDeployConfig): Promise<string[]> {
+    this.assertProject(config.projectId);
+    // Cloud has already resolved and verified the concrete names. Reapplying a
+    // slug prefix here would mount a different, unclaimed empty volume.
+    return config.volumes;
   }
   private async canSpend(): Promise<void> {
     await this.connection.beforeWork();
@@ -330,7 +387,7 @@ export class CloudDockerRuntime extends DockerRuntime {
       const source = `/tmp/openship-cloud-source-${createHash("sha256").update(config.sessionId).digest("hex").slice(0, 24)}`;
       await this.executor.mkdir(source);
       try {
-        if (await prepareManagedSource(this.connection, config, source, logger)) {
+        if (await prepareRemoteSource(this.connection, config, source, logger)) {
           // The source capability supplies already-authorized uploaded bytes.
         } else if (config.localPath) {
           await this.executor.transferIn(config.localPath, source, logger.callback);
@@ -343,7 +400,9 @@ export class CloudDockerRuntime extends DockerRuntime {
         this.sourcePath = source;
         this.sourceBase = base;
       } catch (error) {
-        await this.executor.rm(source).catch(() => {});
+        await this.executor.rm(source).catch((diagnosticFailure) => {
+          observeCaughtError(diagnosticFailure, "adapters/runtime/cloud/docker");
+        });
         throw error;
       }
     })().catch((error) => {
@@ -379,10 +438,50 @@ export class CloudDockerRuntime extends DockerRuntime {
       logger,
     );
   }
+  /** Static output stays on the project-owned workspace tree until Pages exports it. */
+  staticBuildPath(sessionId: string): string {
+    if (!/^[a-zA-Z0-9_-]+$/.test(sessionId)) throw new Error("Invalid build session ID");
+    return `${cloudDockerProjectPaths(this.projectId).bare}/.builds/${sessionId}`;
+  }
+
+  override async buildStaticToHost(config: BuildConfig, hostOutDir: string, logger?: BuildLogger) {
+    this.assertProject(config.projectId);
+    if (hostOutDir !== this.staticBuildPath(config.sessionId))
+      throw new Error("Static build output must belong to this project's build session");
+    const result = await super.buildStaticToHost(config, hostOutDir, logger);
+    if (result.status !== "deploying") {
+      const files = this.staticServeRuntime();
+      try {
+        await files.destroy(hostOutDir);
+      } catch (error) {
+        observeCaughtError(error, "adapters/runtime/cloud/docker");
+        logger?.log(`Static build cleanup deferred: ${safeErrorMessage(error)}\n`, "warn");
+      } finally {
+        await files.dispose();
+      }
+    }
+    return result;
+  }
+
+  staticServeRuntime(): BareRuntime {
+    return new BareRuntime({
+      projectId: this.projectId,
+      workDir: cloudDockerProjectPaths(this.projectId).bare,
+      executor: this.executor,
+      allowHostBuild: false,
+    });
+  }
+
   private remoteBuild(config: BuildConfig): BuildConfig {
     // Repository commands must not run on the SaaS control plane. Inline/folder
     // sources are transferred; Git sources clone directly inside the workspace.
-    return { ...config, cloneOnServer: true, localPath: undefined, staticExtractOnly: false };
+    return {
+      ...config,
+      cloneOnServer: true,
+      managedNodeListener: true,
+      localPath: undefined,
+      staticExtractOnly: Boolean(config.isStatic && config.staticExtractOnly),
+    };
   }
   protected override withDeploymentLock<T>(work: () => Promise<T>): Promise<T> {
     return this.options.provisionLock.run(work);
@@ -430,12 +529,27 @@ export class CloudDockerRuntime extends DockerRuntime {
     );
     return this.ownedVolumeBinds(config.slug || config.projectId, volumes);
   }
+  // Managed mounts are already resolved and ownership-checked by Cloud
+  // activation. They never relied on Docker's anonymous-volume allocation.
+  override async prepareDeploymentVolumes(_config: DeployConfig): Promise<void> {}
+  override async prepareServiceVolumes(_config: MultiServiceDeployConfig): Promise<void> {}
   override async deploy(config: DeployConfig, onLog?: LogCallback) {
     this.assertProject(config.projectId);
     await this.canSpend();
     await this.connection.ensureDocker();
     // Even a single web app/worker gets a project network on a subscribed host.
-    return super.deploy({ ...config, networkAlias: config.networkAlias || "app" }, onLog);
+    const image = await this.accessibleImage(config.imageRef!);
+    const ports = config.portless
+      ? []
+      : [config.port, ...(config.publicEndpoints ?? []).flatMap((e) => (e.port ? [e.port] : []))];
+    return super.deploy(
+      {
+        ...config,
+        networkAlias: config.networkAlias || "app",
+        envVars: managedNodeEnvironment(image.Config?.Labels, config.envVars ?? {}, ports),
+      },
+      onLog,
+    );
   }
   override async ensureServiceGroup(config: Parameters<DockerRuntime["ensureServiceGroup"]>[0]) {
     this.assertProject(config.projectId);
@@ -570,6 +684,7 @@ export class CloudDockerRuntime extends DockerRuntime {
           ...config,
           volumes,
           imageAlreadyPrepared: true,
+          environment: managedNodeEnvironment(image.Config?.Labels, config.environment, [...published.keys()]),
           ...{ namespaceVolumes: true },
           ports: [...published].map(([port, hostPort]) => `0.0.0.0:${hostPort}:${port}`),
         },
@@ -643,11 +758,7 @@ export class CloudDockerRuntime extends DockerRuntime {
     for (const target of new Set(imageVolumes)) {
       if (!target.startsWith("/")) throw new Error("Invalid anonymous volume destination");
       if (targets.has(target)) continue;
-      const key = createHash("sha256")
-        .update(`${config.serviceName}:${target}`)
-        .digest("hex")
-        .slice(0, 24);
-      volumes.push(`openship-${config.slug}-data-${key}:${target}`);
+      volumes.push(`${imageVolumeName(config.serviceName, target)}:${target}`);
     }
     return volumes;
   }
@@ -750,7 +861,18 @@ export class CloudDockerRuntime extends DockerRuntime {
       throw new Error("A Docker workspace is not a service container");
     await this.connection.resume();
     await this.connection.ensureDocker();
-    return super.applyEnvironment(...args);
+    await this.assertContainerAccess(args[0]);
+    const info = await this.docker.getContainer(args[0]).inspect();
+    const ports = Object.entries(info.HostConfig.PortBindings ?? {}).flatMap(([key, bindings]) =>
+      /^\d+\/tcp$/.test(key) && Array.isArray(bindings) && bindings.length
+        ? [Number(key.split("/")[0])]
+        : [],
+    );
+    return super.applyEnvironment(
+      args[0],
+      managedNodeEnvironment(info.Config.Labels, args[1], ports),
+      args[2],
+    );
   }
   override async pullImage(...args: Parameters<DockerRuntime["pullImage"]>) {
     await this.canSpend();
@@ -769,7 +891,7 @@ export class CloudDockerRuntime extends DockerRuntime {
       await super.destroy(owned.Id);
     });
   }
-  async cleanupProject(
+  override async cleanupProject(
     projectId: string,
     options?: {
       wipeVolumes?: boolean;
@@ -778,6 +900,7 @@ export class CloudDockerRuntime extends DockerRuntime {
     this.assertProject(projectId);
     if ((await this.listProjectContainerIds(projectId)).length)
       throw new Error("Remove the project's containers before cleaning its storage");
+    await super.cleanupProject(projectId, options);
     if (options?.wipeVolumes) {
       // Include detached volumes left by interrupted deployments. Inventory is
       // label-scoped; retained data is removed only on the explicit wipe path.
@@ -785,14 +908,16 @@ export class CloudDockerRuntime extends DockerRuntime {
       await this.executor.exec(`rm -rf -- ${sq(this.projectPaths.mounts)}`);
     } else {
       await this.executor.exec(
-        `rm -rf -- ${sq(`${this.projectPaths.mounts}/releases`)} ${sq(`${this.projectPaths.mounts}/config`)}`,
+        `rm -rf -- ${sq(`${this.projectPaths.mounts}/releases`)} ${sq(`${this.projectPaths.mounts}/config`)} ${sq(`${this.projectPaths.bare}/.builds`)}`,
       );
     }
     await this.executor.exec(`rm -rf -- ${sq(this.projectPaths.routes)}`);
   }
   override async dispose() {
     await super.dispose();
-    if (this.sourcePath) await this.executor.rm(this.sourcePath).catch(() => {});
+    if (this.sourcePath) await this.executor.rm(this.sourcePath).catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "adapters/runtime/cloud/docker");
+    });
     await this.connection.dispose();
   }
 }

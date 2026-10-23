@@ -13,6 +13,7 @@ import AppInstallPage from "./page";
 
 const h = vi.hoisted(() => ({
   template: vi.fn(),
+  home: vi.fn(),
   hostFit: vi.fn(),
   services: vi.fn(),
   info: vi.fn(),
@@ -29,6 +30,7 @@ const h = vi.hoisted(() => ({
   toast: vi.fn(),
   requireCloud: vi.fn(),
   cloud: false,
+  automaticCloud: false,
   appId: "convex",
   query: "projectId=draft",
   router: { push: vi.fn(), replace: vi.fn() },
@@ -42,7 +44,7 @@ vi.mock("@/lib/api", () => ({
     updateSettings: h.updateSettings,
   },
   servicesApi: { list: h.services, update: h.updateService },
-  projectsApi: { getInfo: h.info },
+  projectsApi: { getInfo: h.info, getHome: h.home },
   deployApi: { buildAccess: h.build, getBuildStatus: h.buildStatus, buildRedeploy: h.redeploy },
 }));
 vi.mock("next/navigation", () => ({
@@ -78,8 +80,8 @@ vi.mock("@/hooks/useLocalDeployGate", () => ({
 vi.mock("@/components/deploy/AppDestinationPicker", () => ({
   AppDestinationPicker: ({ value, onChange, onReadyChange, readOnly }: ComponentProps<typeof import("@/components/deploy/AppDestinationPicker").AppDestinationPicker>) => {
     useEffect(() => {
-      if (!value && !readOnly) onChange({ deployTarget: h.cloud ? "cloud" : "server", serverId: h.cloud ? "managed-server" : "small-server" });
-      onReadyChange?.(!!value?.serverId);
+      if (!value && !readOnly) onChange({ deployTarget: h.cloud ? "cloud" : "server", serverId: h.automaticCloud ? undefined : h.cloud ? "managed-server" : "small-server" });
+      onReadyChange?.(!!value?.serverId || (h.automaticCloud && value?.deployTarget === "cloud"));
     }, [value, onChange, onReadyChange, readOnly]);
     return <button onClick={() => onChange({ deployTarget: "server", serverId: "small-server" })}>Select small server</button>;
   },
@@ -155,9 +157,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   h.cloud = false;
+  h.automaticCloud = false;
   h.appId = "convex";
   h.query = "projectId=draft";
   h.template.mockReset();
+  h.home.mockResolvedValue({ projects: [] });
   h.hostFit.mockReset().mockResolvedValue({
     data: {
       minResources: null,
@@ -231,6 +235,68 @@ async function renderApp(
   });
   await render();
 }
+
+it.each([false, true])("installs Ollama using the catalog GPU choice (%s)", async useGpu => {
+  await renderApp({ appId: "ollama", cloud: false, template: { ...getAppTemplate("ollama")!, available: true } });
+  if (useGpu) {
+    await click("CPU");
+    await click("NVIDIA GPU");
+  }
+  await click(baseDictionary.projectSettings.appInstall.install);
+  expect(h.install).toHaveBeenCalledWith(expect.objectContaining({ templateId: "ollama", useGpu }));
+});
+
+it("refuses a self-hosted-only app in the Cloud wizard before checkout or installation", async () => {
+  await renderApp({ appId: "open-webui", cloud: true, template: { ...getAppTemplate("open-webui")!, available: true } });
+  expect(button(baseDictionary.projectSettings.appInstall.install).disabled).toBe(true);
+  expect(container.textContent).toContain("This app is self-hosted only");
+  expect(h.install).not.toHaveBeenCalled();
+  expect(h.showCloudPricing).not.toHaveBeenCalled();
+});
+
+it("offers an Ollama API provider without mistaking other AI apps for that protocol", async () => {
+  h.home.mockResolvedValue({ projects: [
+    { id: "provider", name: "My Ollama", appTemplateId: "ollama" },
+    { id: "incompatible", name: "My vLLM", appTemplateId: "vllm" },
+    { id: "frontend", name: "My chat", appTemplateId: "open-webui" },
+  ] });
+  await renderApp({ appId: "open-webui", cloud: false, template: { ...getAppTemplate("open-webui")!, available: true } });
+  await click("None");
+  expect(document.body.textContent).toContain("My Ollama");
+  expect(document.body.textContent).not.toContain("My vLLM");
+  expect(document.body.textContent).not.toContain("My chat");
+});
+
+it("installs Cloud webmail with external IMAP/SMTP settings through the normal app and deployment APIs", async () => {
+  await renderApp({ appId: "webmail", cloud: true });
+  for (const [label, value] of [
+    ["IMAP host", "imap.provider.example"],
+    ["SMTP host", "smtp.provider.example"],
+  ]) {
+    const fieldLabel = [...container.querySelectorAll<HTMLLabelElement>("label")].find(item => item.textContent?.trim() === label)!;
+    const input = document.getElementById(fieldLabel.htmlFor) as HTMLInputElement;
+    expect(input, label).toBeDefined();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
+  await click("Install");
+  await click("Use free domains");
+  expect(h.install).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    templateId: "webmail",
+    serverId: "managed-server",
+    routes: [{ service: "webmail", port: 4080, mode: "free" }],
+  }));
+  expect(h.updateSettings).toHaveBeenCalledExactlyOnceWith("installed-app", expect.arrayContaining([
+    { service: "webmail", key: "DEFAULT_IMAP_HOST", value: "imap.provider.example" },
+    { service: "webmail", key: "DEFAULT_SMTP_HOST", value: "smtp.provider.example" },
+  ]));
+  expect(h.build).toHaveBeenCalledExactlyOnceWith({
+    projectId: "installed-app", serviceDeploymentMode: "services", deployTarget: "cloud", serverId: "managed-server",
+  });
+  expect(h.updateSettings.mock.invocationCallOrder[0]).toBeLessThan(h.build.mock.invocationCallOrder[0]);
+});
 
 it("restores saved routes when a catalog refresh interrupts the draft read", async () => {
   const catalog = deferred<{ data: AppTemplate }>();
@@ -573,6 +639,7 @@ it("applies the confirmed port-only choice to an adopted draft without recreatin
 it.each([
   { cloud: true, deployTarget: "cloud", serverId: "managed-host", workspaceId: "paid-workspace" },
   { cloud: false, deployTarget: "server", serverId: "saved-host", workspaceId: undefined },
+  { cloud: true, deployTarget: "server", serverId: "customer-host", workspaceId: undefined },
 ])("restores the saved $deployTarget host when installing a draft", async ({ cloud, ...placement }) => {
   h.info.mockResolvedValue({ data: { project: { slug: "saved-app", ...placement } } });
   await renderApp({ cloud, draft: true });
@@ -584,7 +651,7 @@ it.each([
   }));
 });
 
-it("offers an upgrade before Cloud installation, then refreshes after returning from billing", async () => {
+it("opens deployment pricing from the upgrade action without leaving app setup", async () => {
   const capacity = {
     minResources: null,
     capacity: { cpuCores: 0, memoryMb: 0, source: "unknown" },
@@ -596,24 +663,26 @@ it("offers an upgrade before Cloud installation, then refreshes after returning 
     },
   };
   h.hostFit.mockResolvedValueOnce({ data: capacity });
+  const refusal = new ApiError(402, "Upgrade required", { code: "PLAN_UPGRADE_REQUIRED", reason: "workspace-capacity" });
+  h.build.mockRejectedValueOnce(refusal);
+  h.showCloudPricing.mockReturnValue(true);
   await renderApp();
   expect(container.textContent).toContain("This app needs 4 vCPU");
-  const upgrade = [...container.querySelectorAll<HTMLAnchorElement>("a")].find((link) =>
-    link.textContent?.includes("Upgrade plan"),
-  );
-  expect(upgrade?.getAttribute("href")).toBe("/billing/plans");
-  expect(upgrade?.target).toBe("_blank");
   expect(h.install).not.toHaveBeenCalled();
   expect(h.build).not.toHaveBeenCalled();
+  await click("Upgrade plan");
+  await click("Use free domains");
+  expect(h.showCloudPricing).toHaveBeenCalledWith(refusal, expect.any(Function));
+  expect(h.router.push).not.toHaveBeenCalled();
   h.hostFit.mockResolvedValue({
     data: { ...capacity, cloud: { ...capacity.cloud, status: "ready" } },
   });
   await act(async () => window.dispatchEvent(new Event("focus")));
   expect(container.textContent).not.toContain("This app needs 4 vCPU");
-  expect(h.build).not.toHaveBeenCalled();
-  await click("Install");
-  await click("Use free domains");
-  expect(h.build).toHaveBeenCalledOnce();
+  const resume = h.showCloudPricing.mock.calls[0]![1] as () => Promise<void>;
+  await act(async () => { await resume(); });
+  expect(h.build).toHaveBeenCalledTimes(2);
+  expect(h.install).toHaveBeenCalledOnce();
 });
 
 it.each(["create", "deploy"])("opens subscription recovery at the app %s gate and retains the draft", async (gate) => {
@@ -623,13 +692,52 @@ it.each(["create", "deploy"])("opens subscription recovery at the app %s gate an
   await renderApp();
   await click("Install");
   await click("Use free domains");
-  expect(h.showCloudPricing).toHaveBeenCalledWith(refusal, ...(gate === "deploy" ? [expect.any(Function)] : []));
+  expect(h.showCloudPricing).toHaveBeenCalledWith(refusal, expect.any(Function));
   expect(h.connect).not.toHaveBeenCalled();
   expect(h.toast).not.toHaveBeenCalled();
-  await click("Install");
-  await click("Use free domains");
+  const resume = h.showCloudPricing.mock.calls[0]![1] as () => Promise<void>;
+  await act(async () => { await resume(); });
   expect(h.install).toHaveBeenCalledTimes(gate === "create" ? 2 : 1);
   expect(h.connect).toHaveBeenCalledWith("new-deployment", false);
+});
+
+it("continues a first Cloud app after subscribing without choosing routes or creating a second draft", async () => {
+  h.automaticCloud = true;
+  const refusal = new ApiError(402, "Upgrade required", {
+    code: "PLAN_UPGRADE_REQUIRED", reason: "static-only", workspaceId: "first-workspace",
+  });
+  h.showCloudPricing.mockReturnValue(true);
+  h.install.mockRejectedValueOnce(refusal);
+  await renderApp();
+  await click("Install");
+  await click("Use free domains");
+  const initialInput = h.install.mock.calls[0]![0];
+  expect(initialInput.serverId).toBeUndefined();
+  const resume = h.showCloudPricing.mock.calls[0]![1] as () => Promise<void>;
+  await act(async () => { await resume(); });
+  expect(h.install).toHaveBeenLastCalledWith(initialInput);
+  expect(h.install).toHaveBeenCalledTimes(2);
+  expect(h.build).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ projectId: "installed-app" }));
+  expect(h.connect).toHaveBeenCalledWith("new-deployment", false);
+});
+
+it("rejects a still-blocked continuation and retries the same project once when it becomes ready", async () => {
+  const refusal = new ApiError(402, "Payment required", { code: "CLOUD_BILLING_BLOCKED" });
+  h.showCloudPricing.mockReturnValue(true);
+  h.build.mockRejectedValueOnce(refusal).mockRejectedValueOnce(refusal);
+  await renderApp();
+  await click("Install");
+  await click("Use free domains");
+  const resume = h.showCloudPricing.mock.calls[0]![1] as () => Promise<void>;
+  await act(async () => { await expect(resume()).rejects.toBe(refusal); });
+  expect(h.connect).not.toHaveBeenCalled();
+  const queued = deferred<unknown>();
+  h.build.mockReturnValueOnce(queued.promise);
+  await act(async () => { void resume(); void resume(); });
+  expect(h.build).toHaveBeenCalledTimes(3);
+  await act(async () => queued.resolve({ data: { deployment_id: "new-deployment" } }));
+  expect(h.install).toHaveBeenCalledOnce();
+  expect(h.connect).toHaveBeenCalledOnce();
 });
 
 it("recovers a capacity refusal before app deployment using the same configured draft", async () => {
@@ -753,6 +861,7 @@ it.each(["install", "advanced"])(
   "checks the renamed instance instead of an unrelated draft: %s",
   async (action) => {
     h.cloud = true;
+    h.info.mockResolvedValue({ data: { project: { slug: "supabase", serverId: "managed-server", workspaceId: "managed-workspace", deployTarget: "cloud" } } });
     h.appId = "supabase";
     h.query = "";
     h.template.mockResolvedValue({
@@ -832,7 +941,7 @@ it("uses the created draft's current plan check after cancelling DNS confirmatio
     expect.objectContaining({ projectId: "installed-app" }),
   );
   expect(container.textContent).toContain("The saved allocation needs a larger plan.");
-  expect(container.querySelector('a[href="/billing/plans"]')).not.toBeNull();
+  expect(button("Upgrade plan").disabled).toBe(false);
 });
 
 it.each([false, true])(
@@ -889,4 +998,31 @@ it("never converts an invalid nonempty hostname into a domainless install", asyn
   );
   expect(h.install).not.toHaveBeenCalled();
   expect(h.build).not.toHaveBeenCalled();
+});
+
+it("offers pgAdmin port-only access without Cloud and keeps PostgreSQL internal", async () => {
+  await renderApp({ appId: "postgresql", cloud: false });
+  const pgadmin = document.querySelector('section[aria-labelledby="endpoint-pgadmin:5050"]')!;
+  const picker = pgadmin.querySelector<HTMLElement>('[aria-haspopup="listbox"]');
+  expect(picker, "pgAdmin exposure selector").not.toBeNull();
+  await act(async () => picker!.click());
+  const port = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find((node) =>
+    node.textContent?.includes("Port only"),
+  );
+  expect(port, "explicit port-only choice").toBeDefined();
+  await act(async () => port!.click());
+  await click("Install");
+  expect(h.install).not.toHaveBeenCalled();
+  const confirmation = document.querySelector('[role="alertdialog"]');
+  expect(confirmation?.textContent).toContain("pgAdmin");
+  expect(confirmation?.textContent).not.toContain("PostgreSQL");
+  await click("Continue without domains");
+  expect(h.install).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      templateId: "postgresql",
+      routes: [{ service: "pgadmin", port: 5050, mode: "port" }],
+    }),
+  );
+  expect(h.requireCloud).not.toHaveBeenCalled();
+  expect(h.build).toHaveBeenCalledOnce();
 });

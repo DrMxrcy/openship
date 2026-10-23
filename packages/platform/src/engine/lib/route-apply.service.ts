@@ -22,7 +22,9 @@
  * failure logs and defers to the next deploy rather than failing the request.
  */
 
-import type { Deployment } from "@repo/db";
+import { registerProjectRoute } from "@repo/platform/engine/lib/project-route-registration";
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
+import { repos, type Deployment } from "@repo/db";
 import type {
   EdgeProxyApi,
   Platform,
@@ -86,6 +88,8 @@ export interface RouteRegister {
    * there is no host directory to serve and those keep a served container.
    */
   staticRoot?: string;
+  /** Only explicit path locations serve traffic; unmatched paths return 404. */
+  notFound?: true;
   /** Cloud target port (workspace expose / domains.connect). */
   port?: number;
   isCustomDomain: boolean;
@@ -141,6 +145,8 @@ export async function reconcileProjectRoutes(
     hostPortTarget?: HostPortTargetIdentity | null;
     /** Strict inventory for a pre-resolved routing target. */
     edgeProxy?: Pick<EdgeProxyApi, "listLoopbackUpstreamPortsStrict">;
+    /** The control plane's dashboard port; set only for the self-app's own routes. */
+    controlPlanePort?: number;
     registers?: RouteRegister[];
     removes?: RouteRemove[];
     /** Repair actions surface best-effort failures without rolling back saved routes. */
@@ -149,7 +155,7 @@ export async function reconcileProjectRoutes(
   },
 ): Promise<void> {
   const warn = (message: string) => {
-    console.warn(message);
+    errorDiagnostics.warn("platform/engine/lib/route-apply.service", message);
     opts.onWarning?.(message);
   };
   const registers = opts.registers ?? [];
@@ -215,9 +221,9 @@ export async function reconcileProjectRoutes(
           await local
             .removeRoute(r.hostname)
             .catch((err) =>
-              warn(
+              { observeCaughtError(err, "platform/engine/lib/route-apply.service"); return warn(
                 `[route-apply] fallback removeRoute ${r.hostname} failed (non-fatal): ${safeErrorMessage(err)}`,
-              ),
+              ); },
             );
         }
       }
@@ -315,6 +321,7 @@ export async function reconcileProjectRoutes(
           projectId: project.id,
           runtime: resolved?.platform.runtime ?? opts.runtime,
           publishes: loopbackGuard.publishes,
+          controlPlanePort: opts.controlPlanePort,
         });
       }
 
@@ -325,20 +332,25 @@ export async function reconcileProjectRoutes(
       const proxy = sanitizeProxySettings(project.routingConfig?.proxy);
       const successfulPublishes: ObservedLoopbackPublish[] = [];
 
+      const externalHosts = new Set(
+        (registers.length ? await repos.domain.listByProject(project.id) : [])
+          .filter(d => d.externalIngress).map(d => d.hostname),
+      );
+
       for (const r of removes) {
         await routing
           .removeRoute(r.hostname)
           .catch((err) =>
-            warn(
+            { observeCaughtError(err, "platform/engine/lib/route-apply.service"); return warn(
               `[route-apply] removeRoute ${r.hostname} failed (non-fatal): ${safeErrorMessage(err)}`,
-            ),
+            ); },
           );
       }
 
       for (const r of registers) {
-        // A route serves `/` from ONE of two things: a host directory (static, files
-        // on disk) or an upstream. Neither → nothing to serve.
-        if (!r.staticRoot && !r.targetUrl) {
+        // Root routes need an upstream or static files. Explicit path tables
+        // deliberately have neither: their unmatched requests return 404.
+        if (!r.staticRoot && !r.targetUrl && !r.notFound) {
           warn(
             `[route-apply] no upstream or static root resolved for ${r.hostname} — route not applied (redeploy to re-sync)`,
           );
@@ -346,20 +358,21 @@ export async function reconcileProjectRoutes(
         }
         const isWebhook = r.webhook ?? (!!webhookHost && r.hostname.toLowerCase() === webhookHost);
         try {
-          await routing.registerRoute({
+          await registerProjectRoute(project, routing, {
             domain: r.hostname,
-            tls: true,
+            tls: !externalHosts.has(r.hostname),
             // A custom domain's TLS is ours to terminate, so the edge must keep a :443
             // listener up for it even before its cert exists — otherwise HTTPS for it
             // falls through to the edge's 443 catch-all, which answers with a
             // domain-less placeholder cert and the branded not-found page, i.e. the
             // domain reads as unconfigured rather than pending (#308).
             // A free *.opsh.io host is fronted by Cloud's edge; not ours.
-            terminatesTlsLocally: r.isCustomDomain,
-            // staticRoot wins when present: it is the more specific instruction, and a
-            // caller that resolved a doc root has already decided this domain serves
-            // files. registerRoute keys off which one is set.
-            ...(r.staticRoot ? { staticRoot: r.staticRoot } : { targetUrl: r.targetUrl! }),
+            terminatesTlsLocally: r.isCustomDomain && !externalHosts.has(r.hostname),
+            // Preserve the planned root behavior: paths only, static files,
+            // or the resolved upstream.
+            ...(r.notFound
+              ? { notFound: true as const }
+              : r.staticRoot ? { staticRoot: r.staticRoot } : { targetUrl: r.targetUrl! }),
             // Project-wide tunables, applied on the LIVE path too so raising an upload
             // limit takes effect on save rather than waiting for a redeploy — the same
             // treatment a domain/port edit already gets.
@@ -372,9 +385,10 @@ export async function reconcileProjectRoutes(
             ...(r.trailingSlash === undefined ? {} : { trailingSlash: r.trailingSlash }),
             ...(r.redirectHost ? { redirectHost: r.redirectHost } : {}),
           });
-          opts.onLog?.(`Applied route ${r.hostname} → ${r.staticRoot ?? r.targetUrl}.`);
+          opts.onLog?.(`Applied route ${r.hostname} → ${r.notFound ? "configured paths (404 otherwise)" : r.staticRoot ?? r.targetUrl}.`);
           successfulPublishes.push(...(loopbackPublishesByRegister.get(r) ?? []));
         } catch (err) {
+          observeCaughtError(err, "platform/engine/lib/route-apply.service");
           warn(
             `[route-apply] registerRoute ${r.hostname} failed (non-fatal): ${safeErrorMessage(err)}`,
           );
@@ -393,6 +407,7 @@ export async function reconcileProjectRoutes(
             edgeProxy: claimContext.edgeProxy,
           });
         } catch (error) {
+          observeCaughtError(error, "platform/engine/lib/route-apply.service");
           // The route mutation is already best-effort and the safe fallback is
           // to KEEP every claim. Surface the deferred cleanup without turning a
           // successfully committed DB edit into an HTTP failure.

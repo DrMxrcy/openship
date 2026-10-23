@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { api, ApiError, getApiBaseUrl, getActiveOrganizationId } from "./client";
 import {
   isResourceOutput,
@@ -271,9 +272,10 @@ export interface ServerContainerGroup {
     name: string;
     sshHost: string;
     isLocal: boolean;
-    /** Projects with an active deployment on this server — an absent edge is an
-     *  issue (not just an offer) only when this is > 0. */
+    /** All projects actively deployed on this server. */
     projectCount: number;
+    /** Whether its deployed projects need edge routing. Absent on older APIs. */
+    edgeRequired?: boolean;
   };
   components: ServerContainerStatus[];
 }
@@ -589,6 +591,8 @@ export interface TunnelInfo {
 }
 
 export const systemApi = {
+  inspectSwarm: (id: string, details = false) => checkedResponse(ServerResourceSchemas.inspectSwarm, api.get(`${endpoints.system.server(id)}/swarm?details=${details}`, { timeout: 45_000 })),
+  connectSwarm: (id: string, input: { name: string; requestId: string }) => checkedResponse(ServerResourceSchemas.connectSwarm, api.post(`${endpoints.system.server(id)}/swarm/connect`, input, { timeout: 45_000 })),
   /**
    * Vhosts the local edge serves that Openship no longer tracks.
    *
@@ -710,9 +714,9 @@ export const systemApi = {
     }, { timeout: 120_000 }),
 
   /** Get the current install session status (or check if one is running) */
-  getInstallSession: (sessionId?: string) =>
+  getInstallSession: (sessionId?: string, serverId?: string) =>
     api.get<SetupSessionInfo>(endpoints.system.installSession, {
-      params: sessionId ? { id: sessionId } : undefined,
+      params: { ...(sessionId ? { sessionId } : {}), ...(serverId ? { serverId } : {}) },
     }),
 
   /** Is a container image swap (edge/mail) running for this server? (re-attach) */
@@ -724,7 +728,25 @@ export const systemApi = {
   // ── Servers CRUD ─────────────────────────────────────────────────────────
 
   listServerDestinations: () => checkedResponse(ServerCollectionSchemas.destinations, api.get(`${endpoints.system.servers}/destinations`)),
-  getServerNetworkSettings: (id: string) => checkedResponse(ServerResourceSchemas.getNetworkSettings, api.get(`${endpoints.system.server(id)}/network-settings`)),
+  managedInfo: (id: string) => checkedResponse(ServerResourceSchemas.managedInfo, api.get(`${endpoints.system.server(id)}/managed/info`)),
+  managedBootLogs: (id: string, input: Parameters<ServerOperations["managedBootLogs"]>[1]) => checkedResponse(ServerResourceSchemas.managedBootLogs, api.post(`${endpoints.system.server(id)}/managed/boot-logs`, input)),
+  managedSshStatus: (id: string) => checkedResponse(ServerResourceSchemas.managedSshStatus, api.get(`${endpoints.system.server(id)}/managed/ssh`)),
+  setManagedSsh: (id: string, input: Parameters<ServerOperations["setManagedSsh"]>[1]) => checkedResponse(ServerResourceSchemas.setManagedSsh, api.patch(`${endpoints.system.server(id)}/managed/ssh`, input)),
+  setManagedSshKey: (id: string, input: Parameters<ServerOperations["setManagedSshKey"]>[1]) => checkedResponse(ServerResourceSchemas.setManagedSshKey, api.put(`${endpoints.system.server(id)}/managed/ssh/key`, input)),
+  setManagedSshPassword: (id: string, input: Parameters<ServerOperations["setManagedSshPassword"]>[1]) => checkedResponse(ServerResourceSchemas.setManagedSshPassword, api.put(`${endpoints.system.server(id)}/managed/ssh/password`, input)),
+  managedSshConnection: (id: string, input: Parameters<ServerOperations["managedSshConnection"]>[1]) => checkedResponse(ServerResourceSchemas.managedSshConnection, api.post(`${endpoints.system.server(id)}/managed/ssh/connection`, input)),
+  managedRuntimeStatus: (id: string) => checkedResponse(ServerResourceSchemas.managedRuntimeStatus, api.get(`${endpoints.system.server(id)}/managed/runtime-api`)),
+  enableManagedRuntime: (id: string, input: Parameters<ServerOperations["enableManagedRuntime"]>[1]) => checkedResponse(ServerResourceSchemas.enableManagedRuntime, api.post(`${endpoints.system.server(id)}/managed/runtime-api/enable`, input)),
+  managedRuntimeCredential: (id: string, input: Parameters<ServerOperations["managedRuntimeCredential"]>[1]) => checkedResponse(ServerResourceSchemas.managedRuntimeCredential, api.post(`${endpoints.system.server(id)}/managed/runtime-api/credential`, input)),
+  rotateManagedRuntimeCredential: (id: string, input: Parameters<ServerOperations["rotateManagedRuntimeCredential"]>[1]) => checkedResponse(ServerResourceSchemas.rotateManagedRuntimeCredential, api.post(`${endpoints.system.server(id)}/managed/runtime-api/rotate`, input)),
+  managedWorkloads: (id: string) => checkedResponse(ServerResourceSchemas.managedWorkloads, api.get(`${endpoints.system.server(id)}/managed/workloads`)),
+  managedWorkloadLogs: (id: string, input: Parameters<ServerOperations["managedWorkloadLogs"]>[1]) => checkedResponse(ServerResourceSchemas.managedWorkloadLogs, api.post(`${endpoints.system.server(id)}/managed/workloads/logs`, input)),
+  createManagedWorkload: (id: string, input: Parameters<ServerOperations["createManagedWorkload"]>[1]) => checkedResponse(ServerResourceSchemas.createManagedWorkload, api.post(`${endpoints.system.server(id)}/managed/workloads`, input)),
+  controlManagedWorkload: (id: string, input: Parameters<ServerOperations["controlManagedWorkload"]>[1]) => checkedResponse(ServerResourceSchemas.controlManagedWorkload, api.post(`${endpoints.system.server(id)}/managed/workloads/control`, input)),
+  getServerNetworkSettings: (id: string) => checkedResponse(ServerResourceSchemas.getNetworkSettings, api.get(`${endpoints.system.server(id)}/network-settings?details=true`)),
+  managedOutbound: (id: string) => checkedResponse(ServerResourceSchemas.managedOutbound, api.get(`${endpoints.system.server(id)}/managed/outbound`)),
+  managedOutboundOptions: (id: string) => checkedResponse(ServerResourceSchemas.managedOutboundOptions, api.get(`${endpoints.system.server(id)}/managed/outbound/options`)),
+  setManagedOutbound: (id: string, input: Parameters<ServerOperations["setManagedOutbound"]>[1]) => checkedResponse(ServerResourceSchemas.setManagedOutbound, api.patch(`${endpoints.system.server(id)}/managed/outbound`, input)),
   updateServerNetworkSettings: (id: string, input: Parameters<ServerOperations["updateNetworkSettings"]>[1]) => checkedResponse(ServerResourceSchemas.updateNetworkSettings, api.patch(`${endpoints.system.server(id)}/network-settings`, input)),
   createManagedServer: (input: Parameters<ServerOperations["createManaged"]>[0]) => checkedResponse(ServerCollectionSchemas.createManaged, api.post(`${endpoints.system.servers}/managed`, input)),
   availableManagedServers: () => checkedResponse(ServerCollectionSchemas.availableManaged, api.get(`${endpoints.system.servers}/managed/available`)),
@@ -848,7 +870,7 @@ export const systemApi = {
       signal,
     });
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
+      const text = await res.text().catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "dashboard/lib/api/system"); return ""; });
       throw new Error(text || `Update failed: ${res.status}`);
     }
 

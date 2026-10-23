@@ -5,8 +5,13 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createPublicEndpoint } from "@/context/deployment/types";
 import PublicEndpointsCard from "./PublicEndpointsCard";
 
+const h = vi.hoisted(() => ({ selfHosted: true, deployTarget: null as string | null }));
 vi.mock("@/context/PlatformContext", () => ({
-  usePlatform: () => ({ selfHosted: true, baseDomain: "opsh.test" }),
+  usePlatform: () => ({ selfHosted: h.selfHosted, baseDomain: "opsh.test" }),
+}));
+vi.mock("@/context/DeploymentContext", () => ({
+  useOptionalDeployment: () =>
+    h.deployTarget ? { config: { deployTarget: h.deployTarget } } : null,
 }));
 vi.mock("@/context/CloudContext", () => ({ useDefaultDomainType: () => "free" }));
 vi.mock("@/context/ModalContext", () => ({
@@ -16,11 +21,50 @@ vi.mock("@/context/ModalContext", () => ({
 let root: Root;
 let container: HTMLDivElement;
 beforeEach(() => {
+  h.selfHosted = true;
+  h.deployTarget = null;
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
 });
+
+it.each([
+  { selfHosted: false, target: "server", supported: false },
+  { selfHosted: true, target: "server", supported: true },
+  { selfHosted: true, target: "cloud", supported: false },
+  { selfHosted: true, target: "cluster", supported: false },
+])(
+  "matches route protection availability for controller=$selfHosted, target=$target",
+  async ({ selfHosted, target, supported }) => {
+    h.selfHosted = selfHosted;
+    h.deployTarget = target;
+    await act(async () =>
+      root.render(
+        <PublicEndpointsCard
+          projectName="private"
+          endpoints={[
+            createPublicEndpoint({
+              domainType: "custom",
+              customDomain: "private.example.com",
+              port: "3000",
+            }),
+          ]}
+          hasServer
+          runtimePort="3000"
+          hideHeader
+          onChange={vi.fn()}
+        />,
+      ),
+    );
+    const protection = container.querySelector<HTMLButtonElement>(
+      'button[aria-label$=": private.example.com"]',
+    );
+    expect(protection).not.toBeNull();
+    await act(async () => protection!.click());
+    expect(document.querySelector('input[type="password"]') !== null).toBe(supported);
+  },
+);
 afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
@@ -107,6 +151,48 @@ it("adds domains with the caller's selected type when its internal type switch i
     [
       expect.objectContaining({ domainType: "custom", customDomain: "api.example.com" }),
       expect.objectContaining({ domainType: "custom", port: "3000" }),
+    ],
+    "3000",
+  );
+});
+
+it("clears incoming redirects when the serving hostname is removed", async () => {
+  const serving = createPublicEndpoint({
+    domainType: "custom",
+    customDomain: "example.com",
+    port: "3000",
+  });
+  const redirect = createPublicEndpoint({
+    domainType: "custom",
+    customDomain: "www.example.com",
+    port: "3000",
+    redirectTo: "example.com",
+    redirectStatus: 301,
+  });
+  const onChange = vi.fn();
+  await act(async () =>
+    root.render(
+      <PublicEndpointsCard
+        projectName="site"
+        endpoints={[serving, redirect]}
+        hasServer
+        runtimePort="3000"
+        allowRedirects
+        onChange={onChange}
+      />,
+    ),
+  );
+  const remove = Array.from(container.querySelectorAll("button")).find(
+    (button) => button.textContent?.trim() === "Remove",
+  )!;
+  await act(async () => remove.click());
+  expect(onChange).toHaveBeenLastCalledWith(
+    [
+      expect.objectContaining({
+        customDomain: "www.example.com",
+        redirectTo: undefined,
+        redirectStatus: undefined,
+      }),
     ],
     "3000",
   );

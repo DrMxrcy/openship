@@ -11,7 +11,9 @@
  *   - Local/desktop never talks to Oblien directly for preflight
  */
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import type { DeploymentConfigSnapshot } from "./build.service";
+import { env } from "../../config/env";
 import { platform } from "../../lib/platform-config";
 import {
   resolveEffectiveTarget,
@@ -27,6 +29,10 @@ import {
   describeResourceFit,
   fitsCapacity,
   hasMinResources,
+  commandEnvironmentWarning,
+  manualBuildCaches,
+  normalizeAppVolume,
+  parseVolumeMount,
 } from "@repo/core";
 import { cloudClient } from "../../lib/cloud/client";
 import { isCloudConnectedForOrg } from "../../lib/cloud/session";
@@ -63,6 +69,7 @@ import { parseRepoUrl } from "../github/github.service";
 import { resolveRecords, lookupAddresses } from "../../lib/dns-resolver";
 import type { ExecutionContext as RequestContext } from "@repo/platform";
 import { getTrustedHostCapacity } from "../../lib/host-capacity";
+import { gpuTargetCheck, servicesRequestingGpu } from "../../lib/gpu-target";
 import { getTemplateForOrg } from "../apps/catalog-source";
 import { repos } from "@repo/db";
 import { requireLinkedCloudServer, remoteCloudRequest } from "../../lib/cloud/server-link";
@@ -85,7 +92,8 @@ async function projectLiveHostnames(projectId: string | undefined): Promise<Set<
     if (!project?.activeDeploymentId) return new Set();
     const domains = await repos.domain.listByProject(projectId);
     return new Set(domains.map((d) => d.hostname.toLowerCase()));
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight");
     return new Set();
   }
 }
@@ -218,10 +226,10 @@ async function checkGitHubAppInstallation(
   // the per-user row.
   let installationId: number | null = null;
   if (ctx.organizationId) {
-    installationId = await getInstallationIdByOrg(ctx.organizationId, owner).catch(() => null);
+    installationId = await getInstallationIdByOrg(ctx.organizationId, owner).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return null; });
   }
   if (!installationId) {
-    installationId = await getInstallationId(ctx, owner).catch(() => null);
+    installationId = await getInstallationId(ctx, owner).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return null; });
   }
   if (installationId) {
     return { ...baseCheck, status: "pass" };
@@ -296,7 +304,7 @@ async function checkRemoteBuildTokenLeak(
   // A per-server credential means the clone authenticates as the SERVER, not by
   // shipping the operator's gh-cli token off-host — so the leak concern (and the
   // cli hard-fail below) doesn't apply.
-  if (serverId && (await canResolveServerGitCredential(serverId).catch(() => false))) {
+  if (serverId && (await canResolveServerGitCredential(serverId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return false; }))) {
     return { ...baseCheck, status: "pass" };
   }
 
@@ -377,7 +385,7 @@ async function checkRemoteCloneToken(
 
   // A per-server GitHub credential (device token / PAT / SSH key) satisfies the
   // clone directly — check it FIRST (matches clone-auth's precedence).
-  if (serverId && (await canResolveServerGitCredential(serverId).catch(() => false))) {
+  if (serverId && (await canResolveServerGitCredential(serverId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return false; }))) {
     return { ...baseCheck, status: "pass" };
   }
 
@@ -386,7 +394,7 @@ async function checkRemoteCloneToken(
   const source = await canResolveTokenFor(ctx, "remote", {
     projectId,
     owner,
-  }).catch(() => null);
+  }).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return null; });
   if (source) return { ...baseCheck, status: "pass" };
 
   // Desktop relay: clones on the build host via the reverse tunnel (nothing
@@ -446,14 +454,14 @@ async function checkCloneOnServerCredential(
 
   // A per-server GitHub credential clones directly on the server — satisfies
   // this check outright.
-  if (serverId && (await canResolveServerGitCredential(serverId).catch(() => false))) {
+  if (serverId && (await canResolveServerGitCredential(serverId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return false; }))) {
     return { ...baseCheck, status: "pass" };
   }
 
   const source = await canResolveTokenFor(ctx, "remote", {
     projectId,
     owner,
-  }).catch(() => null);
+  }).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return null; });
   if (source) return { ...baseCheck, status: "pass" };
 
   return {
@@ -1247,7 +1255,7 @@ async function checkCustomDomainSelfHosted(
     edgeServerId = runtime.plan.hosts.find(host => host.role === "server")!.serverId;
   }
   const serverHost = snapshot?.organizationId
-    ? await resolveServerHost(snapshot.organizationId, edgeServerId).catch(() => null)
+    ? await resolveServerHost(snapshot.organizationId, edgeServerId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return null; })
     : null;
   let serverIps: string[] = [];
   if (serverHost) {
@@ -1413,7 +1421,7 @@ async function checkHostCapacity(
   serverId: string | undefined,
   isLocalTarget: boolean,
 ): Promise<PreflightCheck | null> {
-  const template = await getTemplateForOrg(organizationId, appTemplateId).catch(() => undefined);
+  const template = await getTemplateForOrg(organizationId, appTemplateId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return undefined; });
   const min = template?.minResources;
   if (!template || !hasMinResources(min)) return null;
 
@@ -1430,6 +1438,29 @@ async function checkHostCapacity(
   };
 }
 
+async function checkGpuTarget(
+  organizationId: string,
+  serverId: string | undefined,
+  isLocalTarget: boolean,
+  services: readonly DeployableService[] | undefined,
+): Promise<PreflightCheck | null> {
+  const gpuServices = servicesRequestingGpu(services);
+  if (gpuServices.length === 0) return null;
+  const server = serverId
+    ? await repos.server.getInOrganization(serverId, organizationId).catch((diagnosticFailure) => {
+        // A server row we cannot read only drops the manual GPU mark; detection still decides.
+        observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight");
+        return null;
+      })
+    : null;
+  const capacity = await getTrustedHostCapacity(serverId, organizationId, { isLocalTarget });
+  return gpuTargetCheck({
+    gpuServices,
+    override: (server?.gpuOverride as "yes" | "no" | null | undefined) ?? null,
+    capacity: capacity.source === "docker" ? capacity : null,
+  });
+}
+
 export async function runPreflightChecks(
   snapshot: DeploymentConfigSnapshot,
   opts?: PreflightOptions,
@@ -1438,8 +1469,8 @@ export async function runPreflightChecks(
     const { requireClusterDeploymentTarget, assertClusterWorkloadSupported } = await import("../../lib/cluster-deployment-target");
     if (!snapshot.organizationId || !snapshot.clusterId || !snapshot.clusterProjectId) throw new Error("Choose a project cluster before deploying.");
     if (opts?.projectId && opts.projectId !== snapshot.clusterProjectId) throw new AppError("Cluster workload does not belong to this project.", 404, "CLUSTER_WORKLOAD_NOT_FOUND");
-    await requireClusterDeploymentTarget(snapshot.organizationId, snapshot.clusterId, snapshot.clusterRuntimeId);
-    await assertClusterWorkloadSupported({ projectId: snapshot.clusterProjectId, workload: snapshotToClass(snapshot).workload, volumes: snapshot.volumes,
+    const {runtime} = await requireClusterDeploymentTarget(snapshot.organizationId, snapshot.clusterId, snapshot.clusterRuntimeId);
+    await assertClusterWorkloadSupported({ provider: runtime.provider, projectId: snapshot.clusterProjectId, workload: snapshotToClass(snapshot).workload, volumes: snapshot.volumes,
       services: opts?.multiService ? opts.composeServices?.length ? opts.composeServices : [{}] : [], framework: snapshot.framework,
       image: snapshot.releaseImageRef || snapshot.handoverAppImage, imageRepository: snapshot.clusterConfig?.imageRepository,
     });
@@ -1482,6 +1513,24 @@ export async function runPreflightChecks(
       ? { id: "stack", label: "Service stack", status: "pass" }
       : checkStack(snapshot),
   ];
+  const commandOwners = [{ name: "Project", ...snapshot }, ...(opts?.composeServices ?? []).map(s => ({ ...s, name: `Service ${s.name}` }))];
+  for (const [index, owner] of commandOwners.entries()) {
+    for (const field of ["installCommand", "buildCommand", "startCommand"] as const) {
+      const message = commandEnvironmentWarning(owner[field] ?? "", `${owner.name} ${field}`);
+      if (message) checks.push({ id: `command-env-${index}-${field}`, label: "Command environment", status: "warn", message });
+    }
+    if (owner.framework === "nextjs" && owner.rootDirectory && /(?:^|\s)node\s+\.next\/standalone\/server\.js(?:$|\s)/.test(owner.startCommand ?? "")) {
+      checks.push({ id: `standalone-start-${index}`, label: "Application output", status: "warn", message: `${owner.name} hardcodes a standalone server path. Monorepo output can nest the server under the app directory. Clear the Start override to let Openship locate the server and copy its static/public assets.` });
+    }
+    const caches = manualBuildCaches(owner);
+    if (caches.length) checks.push({ id: `manual-cache-${index}`, label: "Build caches", status: "warn", message: `${owner.name} has manual mounts for managed build-cache paths: ${caches.map(cache => cache.target).join(", ")}. Use the managed-cache migration after a successful deployment.` });
+    const mounts = (owner.volumes ?? []).flatMap(spec => {
+      const normalized = normalizeAppVolume(spec);
+      return normalized ? [parseVolumeMount(normalized).target.replace(/\/+$/, "") || "/"] : [];
+    });
+    const duplicate = [...new Set(mounts.filter((target, index) => mounts.indexOf(target) !== index))];
+    if (duplicate.length) checks.push({ id: `duplicate-mount-${index}`, label: "Duplicate mounts", status: "warn", message: `${owner.name} mounts these paths more than once: ${duplicate.join(", ")}. Keep one mount per path.` });
+  }
 
   // Does this machine meet what the app says it needs? Cloud is sized from the
   // tier table, not from host hardware, so there is nothing to match there (and
@@ -1494,6 +1543,18 @@ export async function runPreflightChecks(
       effectiveTarget === "local",
     );
     if (hostCapacity) checks.push(hostCapacity);
+  }
+
+  // A service that asks for a GPU should land on a server that has one. Warn-only (see
+  // gpuTargetCheck). Same gate as host capacity: cloud/cluster size from tiers, never probe a box.
+  if (snapshot.organizationId && effectiveTarget !== "cloud" && effectiveTarget !== "cluster") {
+    const gpuCheck = await checkGpuTarget(
+      snapshot.organizationId,
+      snapshot.serverId,
+      effectiveTarget === "local",
+      opts?.composeServices,
+    );
+    if (gpuCheck) checks.push(gpuCheck);
   }
 
   if (!hasEndpointRouting && opts?.slug && !opts?.customDomain) {
@@ -1515,7 +1576,7 @@ export async function runPreflightChecks(
   // cloud requirement applies.
   const cloudConnected =
     !cloudPreflight && cloudRequirement !== "none" && snapshot.organizationId
-      ? await isCloudConnectedForOrg(snapshot.organizationId).catch(() => false)
+      ? await isCloudConnectedForOrg(snapshot.organizationId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/preflight"); return false; })
       : false;
   checks.push(await checkCloudRuntime(cloudPreflight, cloudRequirement, cloudConnected));
 
@@ -1541,6 +1602,7 @@ export async function runPreflightChecks(
       )
     : null;
   const clonePlan = resolveClonePlan({
+    isHosted: env.CLOUD_MODE,
     effectiveTarget,
     serverId: plannedTarget?.serverId ?? snapshot.serverId,
     runtimeIsBare: runtimeMode === "bare",

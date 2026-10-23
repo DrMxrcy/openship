@@ -1,5 +1,6 @@
 /** HTTP status/envelope adapters over the shared server operations. */
 import type { Context } from "hono";
+import { parseInput, ServerResourceSchemas } from "@repo/contracts";
 import { getPlatformKernel } from "@repo/platform/engine/lib/platform";
 import { param } from "../../lib/controller-helpers";
 import { operationContext, operationData } from "../../lib/operation-context";
@@ -16,6 +17,16 @@ export async function getServer(c: Context) {
 }
 export async function getInfrastructure(c: Context) {
   return c.json(await operationData(c, operations().infrastructure(operationContext(c), param(c, "id"))));
+}
+export async function inspectSwarm(c: Context) {
+  const details = c.req.query("details");
+  const input = parseInput(ServerResourceSchemas.inspectSwarm.input, {
+    ...(details === undefined ? {} : { details: details === "true" ? true : details === "false" ? false : details }),
+  });
+  return c.json(await operationData(c, operations().inspectSwarm(operationContext(c), param(c, "id"), input)));
+}
+export async function connectSwarm(c: Context) {
+  return c.json(await operationData(c, operations().connectSwarm(operationContext(c), param(c, "id"), await c.req.json())), 201);
 }
 export async function probeReachability(c: Context) {
   return c.json(await operationData(c, operations().reachability(operationContext(c), param(c, "id"))));
@@ -52,7 +63,11 @@ export async function serverUsage(c: Context) {
   return c.json(await operationData(c, operations().usage(operationContext(c), param(c, "id"))));
 }
 export async function getServerNetworkSettings(c: Context) {
-  return c.json(await operationData(c, operations().getNetworkSettings(operationContext(c), param(c, "id"))));
+  const details = c.req.query("details");
+  const input = parseInput(ServerResourceSchemas.getNetworkSettings.input, {
+    details: details === "true" ? true : details === "false" ? false : details,
+  });
+  return c.json(await operationData(c, operations().getNetworkSettings(operationContext(c), param(c, "id"), input)));
 }
 export async function updateServerNetworkSettings(c: Context) {
   return c.json(await operationData(c, operations().updateNetworkSettings(operationContext(c), param(c, "id"), await c.req.json())));

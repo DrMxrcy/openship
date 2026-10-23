@@ -396,6 +396,10 @@
         "failed": "Couldn't update the internal hostname",
         "invalid": "Enter at least one letter or digit"
       }
+    },
+    "export": {
+      "title": "Export project",
+      "description": "Download all project settings, environment values, and credentials as plain JSON."
     }
   },
   "routeRules": {
@@ -705,6 +709,8 @@
       "title": "Rollback history",
       "retentionHint": "Keep recent deployment artifacts for quick rollback.",
       "retentionDescription": "Maximum number of past releases to keep. Active and pinned releases are extra. Older artifacts are removed; deployment history stays available. Set to 0 to keep only active and pinned releases.",
+      "automaticValue": "Up to {count} versions",
+      "automaticDescription": "Keeps up to the default history limit. Under disk pressure, recoverable artifacts may be removed earlier. Active and pinned releases are extra. Commit and configuration history stays available; rollback may require a rebuild.",
       "defaultBadge": "instance default",
       "loadFailed": "Could not load rollback settings.",
       "valueOne": "{count} version",
@@ -715,7 +721,7 @@
       "increaseAria": "Increase rollback history",
       "sizeEach": "~{size} per image, including shared layers",
       "diskFree": "{size} free",
-      "autoBadge": "sized automatically",
+      "autoBadge": "Automatic",
       "manualBadge": "set manually",
       "kindFiles": "built files on disk",
       "kindImages": "images on the host",
@@ -929,7 +935,8 @@
       "error": "Error",
       "inactive": "Inactive",
       "external": "External TLS",
-      "manual": "Manual cert"
+      "manual": "Manual cert",
+      "unknown": "Unknown"
     },
     "typeCustom": "Custom domain",
     "typeFree": "Free subdomain",
@@ -1147,7 +1154,8 @@
         "manual_certificate": "This domain uses an uploaded certificate. Upload a valid replacement, then recheck it. Openship does not renew it automatically.",
         "managed_certificate": "TLS is managed by your external proxy or Openship Cloud. Check that provider’s configuration.",
         "route_missing": "This configured route has not been applied. Retry routing to apply it. No automatic routing retry is scheduled.",
-        "manual_dns": "This certificate uses manual TXT verification. Open HTTPS setup to confirm a new TXT record, or choose a connected DNS provider for automatic renewal."
+        "manual_dns": "This certificate uses manual TXT verification. Open HTTPS setup to confirm a new TXT record, or choose a connected DNS provider for automatic renewal.",
+        "managed_owner": "This hostname and its certificate are managed by the owning service. Check that service’s domain settings."
       }
     },
     "wildcard": {
@@ -1186,6 +1194,12 @@
         "cancelled": "Challenge cancelled",
         "expired": "TXT challenge expired"
       }
+    },
+    "removeRoute": {
+      "title": "Remove route",
+      "description": "The app keeps running — only this route and its edge registration are removed. You can add it back at any time.",
+      "confirm": "Remove route",
+      "removing": "Removing…"
     }
   },
   "serviceEnvironment": {
@@ -1195,5 +1209,43 @@
     "buildArguments": "Build arguments are configured in the Compose file or source configuration and require a rebuild.",
     "projectLink": "Edit shared project environment",
     "loadFailed": "Could not load project variable names to check overrides."
+  },
+  "cloudStaticHosting": {
+    "title": "Static hosting",
+    "description": "Choose where the built files are served.",
+    "pages": "Cloud Pages (default)",
+    "pagesDescription": "Publish files to the Cloud edge. No running app container.",
+    "server": "Managed server",
+    "serverDescription": "Serve files from an nginx container on your managed server.",
+    "nextDeploy": "Saved hosting changes apply on the next deployment."
+  },
+  "deploymentChecks": {
+    "title": "GitHub deployment checks",
+    "description": "Report deployment and service results on the deployed commit.",
+    "customize": "Customize checks",
+    "deployment": "Deployment result",
+    "services": "All services, including new ones",
+    "selectedServices": "Choose services",
+    "includeErrors": "Include failure details",
+    "errorsHint": "Redacted error summaries are shared with people who can read this repository.",
+    "emptySelection": "Choose at least one check, or turn reporting off.",
+    "connectionHint": "Requires a GitHub App with Checks write access.",
+    "connection": "GitHub connection",
+    "deliveryFailed": "Checks could not be delivered",
+    "saveFailed": "Could not save GitHub check settings."
+  },
+  "runtimeUpdates": {
+    "options": "Redeploy options",
+    "refresh": "Refresh images & redeploy",
+    "refreshing": "Refreshing images…",
+    "check": "Check image updates",
+    "title": "Image updates",
+    "failed": "Could not start image refresh.",
+    "uncertain": "The request timed out. Check deployment history before trying again.",
+    "available": "Image updates available",
+    "current": "Image digests match the latest observed registry digests.",
+    "checkUnavailable": "Image comparison needs recorded digests and registry access.",
+    "checkFailed": "Could not check image updates.",
+    "pinned": "Images are pinned by digest. Edit the configured reference to update them."
   }
 }

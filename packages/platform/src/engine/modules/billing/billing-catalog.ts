@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import {
   AppError,
   PRICING,
@@ -39,8 +40,8 @@ export const CLOUD_EDGE_BANDWIDTH_GB: Readonly<Record<PlanTierId, number | null>
 };
 
 // Version price/term changes so checkout retries cannot reuse an earlier quote.
-export const OFFER_VERSION = "10";
-const MONTHLY_OFFER_VERSIONS: ReadonlySet<string> = new Set(["9", OFFER_VERSION]);
+export const OFFER_VERSION = "11";
+const MONTHLY_OFFER_VERSIONS: ReadonlySet<string> = new Set(["9", "10", OFFER_VERSION]);
 const TOPUP_OFFER_VERSION = "3";
 export const offerReference = (tier: PlanTierId) => `openship:${tier}:v${OFFER_VERSION}`;
 
@@ -94,7 +95,7 @@ export function subscriptionPlan(subscription: OblienSubscription, organizationI
     if (!tier) throw new AppError("This cloud plan is not supported by this Openship version", 503, "OBLIEN_PLAN_UNSUPPORTED");
     // Platform subscriptions predate explicit service ceilings; retain their
     // preset rather than applying a new retail offer to an existing customer.
-    return { tier, limits: { ...planLimits(tier), maxServiceResources: undefined }, resourceLimits: inheritedResourceLimits(tier) };
+    return { tier, limits: { ...planLimits(tier), ...(tier !== "free" ? { maxProjects: null, runningServices: null, concurrentBuilds: null } : {}), maxServiceResources: undefined }, resourceLimits: inheritedResourceLimits(tier) };
   }
   const { offer, metadata } = subscription;
   const tier = metadata?.openship_plan as PlanTierId;
@@ -116,7 +117,8 @@ export function subscriptionPlan(subscription: OblienSubscription, organizationI
         !monthlyVersion || !offer.capacity) invalidContract();
     try {
       if (!isDeepStrictEqual(monthlyCapacity(offer.resourceLimits as ReturnType<typeof cloudNamespaceLimits>), offer.capacity)) invalidContract();
-    } catch { invalidContract(); }
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "platform/engine/modules/billing/billing-catalog"); invalidContract(); }
   } else if (monthlyVersion) invalidContract();
   if (custom) {
     if (subscription.billingInterval !== "monthly" || !validCustomOffer(tier, parsed.data, offer)) invalidContract();
@@ -129,6 +131,8 @@ export function subscriptionPlan(subscription: OblienSubscription, organizationI
 /** Openship controls retail price and copy; Oblien purchases the resource pool. */
 export function subscriptionOffer(tier: PlanTierId, interval: "monthly" | "annual"): OblienOffer {
   const raw = PRICING.plans.find(plan => plan.id === tier);
+  if (raw?.availableForPurchase === false)
+    throw new AppError("This plan is retained for existing subscriptions. Choose a current Cloud plan for a new purchase.", 400, "BILLING_PLAN_RETIRED");
   const amount = raw?.price[interval];
   if (!raw || !amount || raw.billing.mode !== "monthly" || interval !== "monthly") {
     throw new AppError("This plan is not available for checkout", 400, "BILLING_PLAN_NOT_PURCHASABLE");
@@ -189,6 +193,7 @@ export function presentCloudPlans(requestedLocale?: string, capacityCatalog?: Ob
     const raw = PRICING.plans.find((item) => item.id === id)!;
     return {
       id,
+      availableForPurchase: plan.availableForPurchase,
       name: raw.billing.checkoutName ?? plan.name,
       description: raw.billing.checkoutDescription ?? (id === "free" ? "" : plan.description),
       popular: plan.popular,
@@ -219,6 +224,7 @@ export function presentCloudPlans(requestedLocale?: string, capacityCatalog?: Ob
   });
   return {
     provider: "oblien",
+    management: PRICING.management,
     locale,
     annual: { enabled: PRICING.annual.enabled, monthsFree: PRICING.annual.monthsFree },
     custom: { resources: PRICING.custom.resources, extraMonthlyCents: PRICING.custom.extraMonthlyCents },

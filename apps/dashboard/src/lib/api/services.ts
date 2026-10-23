@@ -47,7 +47,7 @@ export function sortServicesByPublicFirst<T extends { exposed?: boolean | null }
  *   - PIPELINE (true): compose stack, monorepo sub-app, or anything that BUILDS
  *     from source → keeps per-service Redeploy (build page) + reload-env.
  *   - APP (false): an image app added to a normal/static project → Start/Stop,
- *     internal IP, no Redeploy, no build page.
+ *     internal IP, and the shared image refresh/redeploy operation.
  */
 export function serviceUsesDeployPipeline(
   service: { kind?: "compose" | "monorepo" | string | null; build?: string | null; volumes?: string[] | null },
@@ -132,6 +132,8 @@ export interface ServiceContainer {
   serviceName: string;
   containerId: string | null;
   status: string;
+  /** Docker's reported healthcheck result; absent/null is not proof of health. */
+  health?: "healthy" | "starting" | "unhealthy" | null;
   ip: string | null;
   hostPort: number | null;
   imageRef: string | null;
@@ -194,6 +196,7 @@ export type ServiceInput = {
   environment?: Record<string, string | null> | null;
   volumes?: string[];
   command?: string;
+  commandArgv?: string[];
   restart?: string;
   advanced?: ComposeAdvancedPatch;
   exposed?: boolean;

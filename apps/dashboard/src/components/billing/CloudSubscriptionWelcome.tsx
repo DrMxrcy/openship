@@ -1,5 +1,7 @@
 "use client";
 
+import { cloudSpaceHref } from "@/lib/cloud-spaces";
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { useEffect, useId, useState } from "react";
 import Link from "next/link";
 import { useBillingScope } from "@/components/billing/BillingWorkspaceContext";
@@ -76,7 +78,8 @@ function CheckoutWelcome({
     try {
       const acknowledged = readAcknowledged(storageKey).filter((id) => id !== purchaseKey);
       localStorage.setItem(storageKey, JSON.stringify([...acknowledged, purchaseKey].slice(-20)));
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "dashboard/components/billing/CloudSubscriptionWelcome");
       // Storage is optional; dismissing must work in restricted browsers too.
     }
   }
@@ -142,7 +145,7 @@ function WelcomeContent({ state, onClose }: { state: BillingState; onClose: () =
       )}
       <div className="mt-6 flex flex-col gap-2">
         <Button asChild className="h-11 w-full">
-          <Link href={serverId ? `/servers/${encodeURIComponent(serverId)}` : hasNoProjects ? "/library" : "/projects"} onClick={onClose}>
+          <Link href={serverId ? cloudSpaceHref(serverId) : hasNoProjects ? "/library" : "/projects"} onClick={onClose}>
             {server ? copy.openServer : hasNoProjects ? t.billing.onboarding.stepDeploy : copy.openProjects}
             <Icon name="arrow-right" className="size-4 rtl:rotate-180" aria-hidden="true" />
           </Link>

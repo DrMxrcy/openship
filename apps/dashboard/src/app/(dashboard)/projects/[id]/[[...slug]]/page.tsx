@@ -1,5 +1,7 @@
 "use client";
+import { ProjectActions } from "@/components/actions/ProjectActions";
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 import { DomainSettings } from "../components/DomainSettings";
@@ -17,6 +19,7 @@ import { ProjectTopologyPage } from "@/components/topology/ProjectTopologyPage";
 import { ProjectSidebar, ProjectMobileTabs } from "../components/ProjectSidebar";
 import { ProjectTabSections } from "../components/ProjectTabSections";
 import { DraftProjectView } from "../components/DraftProjectView";
+import { DeletionModal } from "../components/DeletionModal";
 import { environmentErrorMessage, environmentWizardHref } from "../components/environment-next";
 import { getProjectStatus } from "@/utils/project-status";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
@@ -35,6 +38,7 @@ import { ApiError, getApiErrorMessage, projectsApi } from "@/lib/api";
 import { invalidateSidebarNavCounts } from "@/lib/sidebar-nav-counts";
 import ErrorState from "@/components/shared/ErrorState";
 import { PageContainer } from "@/components/ui/PageContainer";
+import { Button } from "@/components/ui/button";
 import { HelpMenu } from "@/components/HelpMenu";
 import { DismissiblePopover } from "@/components/ui/Popover";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -262,6 +266,7 @@ const EnvironmentSwitcher = ({ disabled = false }: { disabled?: boolean }) => {
         router.push(environmentWizardHref(created));
       }
     } catch (error) {
+      observeCaughtError(error, "dashboard/app/(dashboard)/projects/[id]/[[...slug]]/page");
       const message = environmentErrorMessage(error, t.projects.env.failedCreateEnvironment);
       showToast(message, "error", t.projects.env.toastEnvironmentTitle);
     } finally {
@@ -290,6 +295,7 @@ const EnvironmentSwitcher = ({ disabled = false }: { disabled?: boolean }) => {
         router.push(environmentWizardHref(created));
       }
     } catch (error) {
+      observeCaughtError(error, "dashboard/app/(dashboard)/projects/[id]/[[...slug]]/page");
       const message = environmentErrorMessage(error, t.projects.env.failedCreateEnvironment);
       showToast(message, "error", t.projects.env.toastEnvironmentTitle);
     } finally {
@@ -556,6 +562,8 @@ const ProjectSettingsContent = () => {
   // know enough about the project to even render its tabs.
   const { isLoading: isLoadingProjectInfo, error: projectInfoError } = useProjectInfo(id);
   const [topologyHasPending, setTopologyHasPending] = useState(false);
+  const [retryDeletionFor, setRetryDeletionFor] = useState<string | null>(null);
+  const [unconfirmedDeletionFor, setUnconfirmedDeletionFor] = useState<string | null>(null);
 
   const { t } = useI18n();
   const { showToast } = useToast();
@@ -566,6 +574,8 @@ const ProjectSettingsContent = () => {
 
   useEffect(() => {
     viewedProjectId.current = id;
+    setUnconfirmedDeletionFor(null);
+    setRetryDeletionFor(null);
     return () => {
       viewedProjectId.current = null;
     };
@@ -613,8 +623,22 @@ const ProjectSettingsContent = () => {
       if (!active || inFlight || finishedDeletions.current.has(id)) return;
       inFlight = true;
       try {
-        await projectsApi.getInfo(id);
+        const response = await projectsApi.getInfo(id);
+        if (active && response.project && (response.project.lifecycleOperation?.status === "failed" || unconfirmedDeletionFor === id)) {
+          setProjectData((prev) =>
+            prev.id === id
+              ? {
+                  ...prev,
+                  deletedAt: response.project.deletedAt ?? null,
+                  deletionInProgress: response.project.deletionInProgress ?? false,
+                  lifecycleOperation: response.project.lifecycleOperation ?? null,
+                }
+              : prev,
+          );
+          setUnconfirmedDeletionFor(prev => prev === id ? null : prev);
+        }
       } catch (err) {
+        observeCaughtError(err, "dashboard/app/(dashboard)/projects/[id]/[[...slug]]/page");
         if (!active || finishedDeletions.current.has(id)) return;
         if (err instanceof ApiError && err.status === 404) {
           active = false;
@@ -630,7 +654,15 @@ const ProjectSettingsContent = () => {
       active = false;
       clearInterval(iv);
     };
-  }, [finishEnvironmentDeletion, id, isDeleting, showToast, t.projects.delete.alreadyDeleted]);
+  }, [
+    finishEnvironmentDeletion,
+    id,
+    isDeleting,
+    setProjectData,
+    showToast,
+    t.projects.delete.alreadyDeleted,
+    unconfirmedDeletionFor,
+  ]);
 
   const handleDeleteProject = async (
     wipeVolumes = false,
@@ -642,8 +674,43 @@ const ProjectSettingsContent = () => {
     forceOrphan = false,
   ) => {
     const deletedId = projectData.id;
+    setUnconfirmedDeletionFor(prev => prev === deletedId ? null : prev);
     const setDeletionState = (deletedAt: string | null) => {
-      setProjectData((prev) => (prev.id === deletedId ? { ...prev, deletedAt } : prev));
+      setProjectData((prev) =>
+        prev.id === deletedId
+          ? {
+              ...prev,
+              deletedAt,
+              ...(deletedAt ? { lifecycleOperation: null } : {}),
+            }
+          : prev,
+      );
+    };
+    const refreshDeletionState = async () => {
+      try {
+        const response = await projectsApi.getInfo(deletedId);
+        const current = response.project;
+        if (current)
+          setProjectData((prev) =>
+            prev.id === deletedId
+              ? {
+                  ...prev,
+                  deletedAt: current.deletedAt ?? null,
+                  deletionInProgress: current.deletionInProgress ?? false,
+                  lifecycleOperation: current.lifecycleOperation ?? null,
+                }
+              : prev,
+          );
+        if (current) return "found";
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          finishEnvironmentDeletion(deletedId);
+          return "deleted";
+        }
+        observeCaughtError(error, "dashboard/project-deletion-refresh");
+      }
+      if (viewedProjectId.current === deletedId) setUnconfirmedDeletionFor(deletedId);
+      return "unknown";
     };
     // Optimistic - immediately show "Deleting" status
     setDeletionState(new Date().toISOString());
@@ -707,7 +774,7 @@ const ProjectSettingsContent = () => {
       // "success" because the row IS gone — the warning content lives in
       // the title + body. router.push so the user doesn't see a ghost.
       if (Array.isArray(response.unrecoverable) && response.unrecoverable.length > 0) {
-        console.warn("[delete-project] partial cleanup", response.unrecoverable);
+        errorDiagnostics.warn("dashboard/app/(dashboard)/projects/[id]/[[...slug]]/page", "[delete-project] partial cleanup", response.unrecoverable);
         showToast(
           interpolate(t.projects.delete.partialCleanup, {
             count: String(response.unrecoverable.length),
@@ -719,7 +786,9 @@ const ProjectSettingsContent = () => {
         return;
       }
       // Defensive: 2xx with ok=false but no unrecoverable list. Treat as failure.
-      setDeletionState(null);
+      const deletionState = await refreshDeletionState();
+      if (deletionState === "deleted") return;
+      if (deletionState === "found") setDeletionState(null);
       showToast(
         response.message || response.error || t.projects.delete.failed,
         "error",
@@ -735,7 +804,9 @@ const ProjectSettingsContent = () => {
       }
 
       // Actual failure: the project still exists, so undo the optimistic status.
-      setDeletionState(null);
+      const deletionState = await refreshDeletionState();
+      if (deletionState === "deleted") return;
+      if (deletionState === "found") setDeletionState(null);
 
       if (err instanceof ApiError && err.status === 409) {
         const body = (err.body ?? {}) as {
@@ -780,7 +851,7 @@ const ProjectSettingsContent = () => {
         const reasons = [
           ...new Set((body.unrecoverable ?? []).map((u) => u.error?.trim() || u.step)),
         ].join(" · ");
-        console.error("[delete-project] teardown failed", body.unrecoverable);
+        errorDiagnostics.error("dashboard/app/(dashboard)/projects/[id]/[[...slug]]/page", "[delete-project] teardown failed", body.unrecoverable, err);
         // The source teardown couldn't complete. Rather than a jarring
         // window.confirm (or silently reverting to a plain "Draft"), surface a
         // themed module offering the storage-only delete (forceOrphan) — atomic
@@ -863,6 +934,8 @@ const ProjectSettingsContent = () => {
         return <ServicesTab />;
       case "domains":
         return <DomainSettings />;
+      case "actions":
+        return <ProjectActions projectId={id} />;
       case "deployments":
         return <Deployments />;
       case "health":
@@ -972,6 +1045,46 @@ const ProjectSettingsContent = () => {
   // otherwise render empty. In-flight first builds (queued/building/
   // deploying) and live projects fall through to the normal layout.
   const status = getProjectStatus(projectData);
+  const cleanupFailure =
+    projectData.lifecycleOperation?.status === "failed" ? projectData.lifecycleOperation : null;
+  const deletionNotice = projectData.deletionInProgress || unconfirmedDeletionFor === id ? (
+    <>
+      <div
+        role="alert"
+        className="mb-6 flex flex-wrap items-center justify-between gap-4 rounded-2xl bg-danger-bg p-5 text-sm"
+      >
+        <div className="min-w-0 flex-1 space-y-1">
+          <p className="font-medium text-danger">
+            {cleanupFailure
+              ? t.projects.delete.cleanupFailedTitle
+              : t.projects.delete.deletionInProgressTitle}
+          </p>
+          <p className="text-muted-foreground">{t.projects.delete.cleanupPending}</p>
+          {cleanupFailure?.error && (
+            <p className="break-words text-danger">{cleanupFailure.error}</p>
+          )}
+        </div>
+        <Button
+          variant="secondary"
+          disabled={!!projectData.deletedAt && unconfirmedDeletionFor !== id}
+          onClick={() => setRetryDeletionFor(id)}
+        >
+          {t.projects.delete.retryCleanup}
+        </Button>
+      </div>
+      <DeletionModal
+        isOpen={retryDeletionFor === id}
+        onClose={() => setRetryDeletionFor(null)}
+        projectId={id}
+        projectName={projectData.name}
+        selfHosted={projectData.deployTarget !== "cloud"}
+        onConfirm={(wipeVolumes, recordOnly) => {
+          setRetryDeletionFor(null);
+          void handleDeleteProject(wipeVolumes, recordOnly);
+        }}
+      />
+    </>
+  ) : null;
   const isNeverDeployed =
     ["draft", "failed", "cancelled"].includes(status) ||
     // A draft mid-delete: the optimistic `deletedAt` masks the draft status
@@ -979,13 +1092,15 @@ const ProjectSettingsContent = () => {
     // handles the pending state) instead of flipping to the analytics
     // dashboard for the duration of the teardown. A never-deployed project
     // has no activeDeploymentId — that's the discriminator vs. a live delete.
+    (projectData.deletionInProgress && !projectData.activeDeploymentId) ||
     (status === "deleting" && !projectData.activeDeploymentId);
   // Configured drafts can inspect their services in Topology before deploying.
   // Other draft tabs keep the focused setup screen, including stale runtime links.
-  if (isNeverDeployed && activeTab !== "topology") {
+  if (isNeverDeployed && activeTab !== "topology" && activeTab !== "actions") {
     return (
       <PageContainer className="@container/project-draft">
-        <DraftProjectView onDeleteProject={() => handleDeleteProject()} />
+        {deletionNotice}
+        <DraftProjectView onDeleteProject={handleDeleteProject} />
       </PageContainer>
     );
   }
@@ -1035,6 +1150,7 @@ const ProjectSettingsContent = () => {
       </div>
 
       {/* Content */}
+      {deletionNotice}
       <div className={`grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-6 ${activeTab === "topology" ? "flex-1 lg:flex-none" : ""}`}>
         {/* ── LEFT COLUMN ── */}
         <div className={`min-w-0 ${activeTab === "topology" ? "flex flex-col gap-6" : "space-y-6"}`}>

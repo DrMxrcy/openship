@@ -243,7 +243,7 @@ describe("checkout return confirmation", () => {
 });
 
 describe("paid server delivery", () => {
-  const setupLink = () => container.querySelector('a[href="/servers/srv_selected?tab=activity"]');
+  const setupLink = () => container.querySelector('a[href="/resources?pool=srv_selected&tab=activity"]');
   const recheck = async () => {
     const button = Array.from(container.querySelectorAll("button")).find(item => item.textContent === copy.checkAgain);
     expect(button).toBeDefined();
@@ -429,7 +429,7 @@ describe("confirmed Cloud subscription welcome", () => {
     expect(dialog()?.textContent).toContain("Your Custom plan is active");
     const capacity = [...dialog()!.querySelectorAll("dl dd")].map(node => node.textContent);
     expect(capacity).toEqual(["6", "24 GB", "180 GB"]);
-    expect(dialog()?.querySelector('a[href="/servers/srv_selected"]')).not.toBeNull();
+    expect(dialog()?.querySelector('a[href="/resources?pool=srv_selected"]')).not.toBeNull();
     expect(dialog()?.querySelector('a[href="/billing/overview?workspaceId=cws_selected&organizationId=org_1"]')).not.toBeNull();
     expect(dialog()?.querySelector('a[href="/library"]')).toBeNull();
   });
@@ -446,7 +446,7 @@ describe("confirmed Cloud subscription welcome", () => {
     mocks.server.mockResolvedValue({ id: "srv_second", managed: { ...readyServer.managed, id: "cws_second", serverId: "srv_second" } });
     await render({ ...subscription, checkoutId: "cs_second" }, "cws_second");
     expect(dialog()?.textContent).toContain("Second server is ready");
-    expect(dialog()?.querySelector('a[href="/servers/srv_second"]')).not.toBeNull();
+    expect(dialog()?.querySelector('a[href="/resources?pool=srv_second"]')).not.toBeNull();
     await act(async () => dismiss().click());
     mocks.state.mockResolvedValue(monthlyState);
     mocks.checkout.mockResolvedValue({ ...paid, creditsGranted: 0 });
@@ -455,12 +455,11 @@ describe("confirmed Cloud subscription welcome", () => {
     expect(dialog()).toBeNull();
   });
 
-  it("celebrates the verified plan with its live allowances and a first-project action", async () => {
+  it("welcomes the verified plan without inventing capacity from quota-only metadata", async () => {
     await render(subscription);
     expect(dialog()?.textContent).toContain("Welcome to Launch");
-    expect(dialog()?.querySelector("dl")?.textContent).toContain("13");
-    expect(dialog()?.querySelector("dl")?.textContent).toContain("7");
-    expect(dialog()?.querySelector("dl")?.textContent).toContain("321 min / month");
+    expect(dialog()?.querySelector("dl")).toBeNull();
+    expect(dialog()?.textContent).not.toContain("321 min / month");
     expect(dialog()?.querySelector('a[href="/library"]')).not.toBeNull();
     expect(dialog()?.querySelector('a[href="/billing/overview"]')).not.toBeNull();
     expect(mocks.router.refresh).toHaveBeenCalledOnce();

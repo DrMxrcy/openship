@@ -24,6 +24,7 @@
  * audit log and the operator's Slack tell the same story.
  */
 
+import { diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import {
   repos,
   incidentSeverity,
@@ -71,6 +72,9 @@ export interface WorkloadTarget {
   serviceName: string;
   serverId: string | null;
   containerId: string | null;
+  /** Release and stored identity hint used to resolve the live container. */
+  deploymentId?: string | null;
+  trackedContainerId?: string | null;
 }
 
 /** What one tick observed about a broken workload. */
@@ -156,7 +160,7 @@ async function announce(opts: {
       // The alert matters more than its audit cross-link, so this never blocks the
       // notification — it just loses the "view in audit log" deep link. Logged because
       // silently degrading to a linkless alert looked identical to a working one.
-      console.error(`[monitoring] audit event for ${opts.eventType} failed: ${safeErrorMessage(err)}`);
+      errorDiagnostics.error("platform/engine/modules/monitoring/incident.service", `[monitoring] audit event for ${opts.eventType} failed: ${safeErrorMessage(err)}`, err);
       return undefined;
     });
 
@@ -181,8 +185,8 @@ async function announce(opts: {
   await repos.serviceIncident
     .markNotified(opts.incident.id)
     .catch((err) =>
-      console.error(
-        `[monitoring] incident ${opts.incident.id} notified-marker failed (may re-notify): ${safeErrorMessage(err)}`,
+      errorDiagnostics.error("platform/engine/modules/monitoring/incident.service",
+        `[monitoring] incident ${opts.incident.id} notified-marker failed (may re-notify): ${safeErrorMessage(err)}`, err,
       ),
     );
 }
@@ -205,6 +209,8 @@ export async function recordWorkloadFailure(
     restartCount: observation.restartCount,
     oomKilled: observation.oomKilled,
     containerId: target.containerId,
+    deploymentId: target.deploymentId ?? null,
+    trackedContainerId: target.trackedContainerId ?? null,
   };
 
   if (!existing) {

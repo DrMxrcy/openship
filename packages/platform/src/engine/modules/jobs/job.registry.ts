@@ -15,6 +15,7 @@
  */
 
 import { repos } from "@repo/db";
+import { env } from "../../config/env";
 import { platform } from "@repo/platform/engine/lib/platform-config";
 import { renewExpiringCerts } from "@repo/platform/engine/lib/ssl-scheduler";
 import { runOrphanSweep } from "@repo/platform/engine/modules/projects/orphan-gc-schedule";
@@ -70,6 +71,14 @@ const ANALYTICS_ROLLUP_RETENTION_DAYS = 400;
 const RESOURCE_USAGE_RETENTION_DAYS = 30;
 
 export const SYSTEM_JOB_DEFS: SystemJobDef[] = [
+  { key: "github:pr-previews", label: "Pull request preview environments", defaultCron: "*/30 * * * * *",
+    run: async () => { await (await import("../projects/pull-request-previews")).runPullRequestPreviewsSweep(); return { checked: true }; } },
+  {
+    key: "github:deployment-checks",
+    label: "GitHub deployment Checks",
+    defaultCron: "*/10 * * * * *",
+    run: async () => (await import("../deployments/deployment-checks")).runDeploymentChecksSweep(),
+  },
   {
     key: "cloud:workspace-recovery",
     label: "Cloud workspace operations",
@@ -82,8 +91,9 @@ export const SYSTEM_JOB_DEFS: SystemJobDef[] = [
     label: "SSL certificate renewal",
     defaultCron: "17 3 * * *",
     // Desktop resolves each certificate's remote serving host, just like self-hosted.
-    // Both run while Openship is running; cloud owns TLS at its managed edge.
-    available: () => platform().target !== "cloud",
+    // Managed Cloud edges are excluded by the certificate resolver; customer
+    // servers use this same renewal job when their control plane is hosted.
+    available: () => true,
     run: async () => {
       const r = await renewExpiringCerts();
       return { renewed: r.renewed, failed: r.failed, total: r.total };
@@ -167,9 +177,8 @@ export const SYSTEM_JOB_DEFS: SystemJobDef[] = [
     // Only a seed — the job row is authoritative once created, so an operator with
     // many servers can stretch it from the Jobs UI without a code change.
     defaultCron: "13,43 * * * *",
-    // Cloud traffic analytics live at Oblien's edge and are read through,
-    // rather than scraped from a host OpenResty instance.
-    available: () => platform().target !== "cloud",
+    // The collector excludes provider VMs and the SaaS control-plane host.
+    available: () => true,
     run: async () => runAnalyticsScrapeSweep(),
   },
   {
@@ -234,6 +243,28 @@ export const SYSTEM_JOB_DEFS: SystemJobDef[] = [
     },
   },
   {
+    key: "deployments:cloud-build-queue",
+    label: "Cloud build queue",
+    available: () => env.CLOUD_MODE,
+    defaultCron: "* * * * *",
+    run: async () => {
+      const { drainCloudBuildQueue } = await import("../deployments/cloud-build-queue");
+      return drainCloudBuildQueue();
+    },
+  },
+  {
+    key: "deployments:cloud-build-recovery",
+    label: "Cloud build recovery",
+    available: () => env.CLOUD_MODE,
+    defaultCron: "* * * * *",
+    run: async () => {
+      // Command recovery on an unreachable server must not delay normal queue
+      // dispatch on unrelated servers. It has its own independently scheduled job.
+      const { recoverCloudBuildQueue } = await import("../deployments/cloud-build-queue");
+      return recoverCloudBuildQueue();
+    },
+  },
+  {
     key: "deployments:reconcile",
     label: "Deployment reconcile",
     defaultCron: "*/10 * * * *",
@@ -261,6 +292,15 @@ export const SYSTEM_JOB_DEFS: SystemJobDef[] = [
         sslIssued: r.sslIssued ?? 0,
         sslRetrying: r.sslRetrying ?? 0,
       };
+    },
+  },
+  {
+    key: "domains:check-https",
+    label: "Cloud HTTPS health",
+    defaultCron: "2-59/5 * * * *",
+    run: async () => {
+      const { checkCloudDomainHttps } = await import("../domains/cloud-ssl-health");
+      return checkCloudDomainHttps();
     },
   },
   {
@@ -416,7 +456,6 @@ export const SYSTEM_JOB_DEFS: SystemJobDef[] = [
     // Build cache is daemon-wide and has no reliable project label. Keep a 5 GiB
     // LRU budget on each Docker host instead of coupling it to image retention.
     defaultCron: "37 4 * * *",
-    available: () => platform().target !== "cloud",
     run: async () => {
       const r = await runBuildCacheGcSweep();
       return {

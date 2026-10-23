@@ -1,5 +1,6 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -10,8 +11,10 @@ import { AppLogo } from "@/components/AppLogo";
 import { VerifiedBadge } from "@/components/apps/VerifiedBadge";
 import { HostingBadge } from "@/components/apps/HostingBadge";
 import { UnverifiedBadge } from "@/components/apps/UnverifiedBadge";
+import { AppGpuBadge } from "@/components/apps/AppGpuBadge";
+import { usePlatform } from "@/context/PlatformContext";
 import { AddCustomAppModal } from "@/components/apps/AddCustomAppModal";
-import { useI18n } from "@/components/i18n-provider";
+import { useI18n, interpolate } from "@/components/i18n-provider";
 import { useToast } from "@/context/ToastContext";
 import { HelpMenu } from "@/components/HelpMenu";
 
@@ -23,13 +26,14 @@ import { HelpMenu } from "@/components/HelpMenu";
 
 // Stable display order for the category tab bar; only categories actually
 // present in the catalog are shown.
-const CATEGORY_ORDER = ["backend", "database", "cms", "analytics", "automation", "mail", "other"] as const;
+const CATEGORY_ORDER = ["backend", "database", "cms", "ai", "analytics", "automation", "mail", "other"] as const;
 
 /** Not installable right now: coming-soon OR needs a newer Openship. */
 const isLocked = (a: AppCatalogEntry) => !!a.comingSoon || !!a.requiresUpdate;
 
 export function AppCatalog({ embedded = false }: { embedded?: boolean } = {}) {
   const { t } = useI18n();
+  const { selfHosted } = usePlatform();
   const router = useRouter();
   const { showToast } = useToast();
   const searchParams = useSearchParams();
@@ -45,15 +49,17 @@ export function AppCatalog({ embedded = false }: { embedded?: boolean } = {}) {
     appsApi
       .catalog()
       .then((r) => setCatalog(r.data ?? []))
-      .catch(() => {});
+      .catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "dashboard/components/apps/AppCatalog");
+      });
 
   const removeCustomApp = async (app: AppCatalogEntry) => {
     try {
       await appsApi.removeCustom(app.id);
       await loadCatalog();
-      showToast(`Removed "${app.name}".`, "success");
+      showToast(interpolate(ap.removedToast || "Removed \"{name}\".", { name: app.name }), "success");
     } catch (err) {
-      showToast(getApiErrorMessage(err, "Couldn't remove the app."), "error");
+      showToast(getApiErrorMessage(err, ap.removeFailedToast || "Couldn't remove the app."), "error");
     }
   };
   const [query, setQuery] = useState("");
@@ -70,15 +76,16 @@ export function AppCatalog({ embedded = false }: { embedded?: boolean } = {}) {
       .filter((a) => {
         if (category !== "all" && a.category !== category) return false;
         if (!q) return true;
-        return `${a.name} ${a.description} ${(a.tags ?? []).join(" ")}`.toLowerCase().includes(q);
+        const localizedDesc = (t.library as any)?.catalog?.apps?.[a.id] || "";
+        return `${a.name} ${a.description} ${localizedDesc} ${(a.tags ?? []).join(" ")}`.toLowerCase().includes(q);
       })
       // Installable apps lead (grouped up front); locked ones (coming-soon or
       // needs-newer-Openship) after — a stable sort keeps order within a group.
       .sort((a, b) => Number(isLocked(a)) - Number(isLocked(b)));
-  }, [catalog, category, query]);
+  }, [catalog, category, query, t.library]);
 
   const catLabel = (c: string) =>
-    (ap.categories as Record<string, string> | undefined)?.[c] ?? c;
+    (ap.categories as Record<string, string> | undefined)?.[c] ?? (c === "ai" ? "AI & models" : c);
 
   useEffect(() => {
     loadCatalog().finally(() => setLoading(false));
@@ -149,7 +156,7 @@ export function AppCatalog({ embedded = false }: { embedded?: boolean } = {}) {
             onClick={() => setAddOpen(true)}
             className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
           >
-            <UiIcon name="plus" className="size-4" /> Add custom
+            <UiIcon name="plus" className="size-4" /> {ap.addCustom || "Add custom"}
           </button>
           {/* The shared help menu, with this page's own guide link on top —
               so Support / Report issue / Docs read identically everywhere. */}
@@ -157,7 +164,7 @@ export function AppCatalog({ embedded = false }: { embedded?: boolean } = {}) {
             extraActions={[
               {
                 id: "guide",
-                label: "How to add an app",
+                label: ap.howToAddApp || "How to add an app",
                 icon: <UiIcon name="book" className="size-4" />,
                 onClick: () =>
                   window.open(
@@ -231,15 +238,16 @@ export function AppCatalog({ embedded = false }: { embedded?: boolean } = {}) {
                     <AppLogo appId={app.id} className="size-[22px]" />
                   </div>
                   <div className="min-w-0 flex-1">
+                    {app.supportsCloud === false && <p className="mb-1 text-xs text-muted-foreground">{selfHosted ? ap.gpu.selfHostedOnly : "Requires your own server"}</p>}
                     <div className="flex items-center justify-between gap-2">
                       <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-foreground">
                         <span className="truncate">{app.name}</span>
                         {app.verified && <VerifiedBadge className="shrink-0" />}
-                        <HostingBadge hosting={app.hosting} />
+                        {!app.comingSoon && <HostingBadge hosting={app.hosting} />}
                       </span>
                       {needsUpdate ? (
                         <span className="shrink-0 rounded-full border border-warning/40 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning">
-                          {app.requiresUpdate?.minVersion ? `Needs v${app.requiresUpdate.minVersion}` : "Needs update"}
+                          {app.requiresUpdate?.minVersion ? interpolate(ap.needsVersionBadge || "Needs v{version}", { version: app.requiresUpdate.minVersion }) : (ap.needsUpdateBadge || "Needs update")}
                         </span>
                       ) : app.comingSoon ? (
                         <span className="shrink-0 rounded-full border border-border/60 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -255,16 +263,17 @@ export function AppCatalog({ embedded = false }: { embedded?: boolean } = {}) {
                     </div>
                     <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">
                       {needsUpdate
-                        ? "Update your Openship instance to install this app."
-                        : app.description}
+                        ? (ap.needsUpdateDesc || "Update your Openship instance to install this app.")
+                        : (t.library as any)?.catalog?.apps?.[app.id] || app.description}
                     </p>
+                    {app.gpu && <div className="mt-2 min-w-0"><AppGpuBadge gpu={app.gpu} /></div>}
                   </div>
                 </button>
                 {app.custom && (
                   <button
                     type="button"
-                    title="Remove custom app"
-                    aria-label="Remove custom app"
+                    title={ap.removeCustomApp || "Remove custom app"}
+                    aria-label={ap.removeCustomApp || "Remove custom app"}
                     onClick={() => removeCustomApp(app)}
                     className="absolute end-2 top-2 rounded-md p-1 text-muted-foreground/50 opacity-0 transition-opacity hover:bg-muted hover:text-foreground focus:opacity-100 group-hover:opacity-100"
                   >

@@ -19,6 +19,9 @@ import type {
   ProjectObjectStorage,
   OpenshipReadiness,
   ClusterWorkloadConfig,
+  GitHubDeploymentChecks,
+  StackRole,
+  ProjectLifecycleOperation,
 } from "@repo/core";
 import { organization } from "./organization";
 import { service } from "./service";
@@ -148,6 +151,13 @@ export const project = pgTable(
     gitUrl: text("git_url"),
     /** Installation ID for GitHub App access */
     installationId: integer("installation_id"),
+    /** Null uses the shared default: deployment and per-service GitHub Checks. */
+    githubChecks: jsonb("github_checks").$type<GitHubDeploymentChecks | null>(),
+    /** Opt-in pull request environments. A custom base domain uses the server's wildcard DNS/TLS. */
+    previewSettings: jsonb("preview_settings").$type<{ enabled: boolean; baseDomain?: string; comments: boolean; protectionHostname?: string } | null>(),
+    previewScannedAt: timestamp("preview_scanned_at"),
+    /** Internal successful build receipts, keyed by project or service id. */
+    buildCacheReceipts: jsonb("build_cache_receipts").$type<Record<string, { targets: string[]; deploymentId: string; completedAt: string; durationMs?: number }> | null>(),
     /**
      * Per-project clone-token override (encrypted via lib/encryption).
      * When set, this is the first credential `resolveCloneToken` returns -
@@ -212,8 +222,20 @@ export const project = pgTable(
      * redeploy of an old release replays the commands as they were.
      */
     releaseCommands: jsonb("release_commands").$type<string[] | null>(),
+    /**
+     * Extra processes (queue workers, a scheduler) that run from the same built
+     * image as the web app (#935). NULL = web only, which is every existing
+     * project, so nothing changes for them; `[]` = explicitly no roles. Stored
+     * without the preset-only `when`/`unless` fields. Seeded from
+     * `openship.json`'s `roles`; snapshotted onto each deployment.
+     */
+    roles: jsonb("roles").$type<StackRole[] | null>(),
     /** Docker image for build environment (e.g. node:22, oven/bun:latest) */
     buildImage: text("build_image"),
+    /** Explicit runtime version, validated by the selected stack; null preserves its defaults. */
+    runtimeVersion: text("runtime_version"),
+    /** Optional custom production base image; null resolves the stack default. */
+    runtimeImage: text("runtime_image"),
     /** Production mode: host, static, standalone */
     productionMode: text("production_mode").default("host"),
     /** Port the app listens on (inside the container / the bare process). */
@@ -301,6 +323,11 @@ export const project = pgTable(
      * deploy time (the prior wizard-only behavior).
      */
     runtimeMode: text("runtime_mode"),
+    /** Cloud static delivery; frozen per deployment so rollback keeps its hosting mode. */
+    cloudStaticHosting: text("cloud_static_hosting")
+      .$type<"pages" | "server">()
+      .notNull()
+      .default("pages"),
     /**
      * Deployment-class axes (see @repo/core deployment-class.ts). These
      * deconflate the legacy `hasServer`/`hasBuild` booleans, which each mixed
@@ -487,10 +514,13 @@ export const project = pgTable(
     /**
      * Set true at the start of the atomic teardown flow so concurrent
      * requests refuse to operate on the row. The teardown either succeeds
-     * (row hard-deletes — flag disappears with it) or fails (flag is
-     * cleared so the caller can retry). NEVER stays true at rest.
+     * (row hard-deletes — flag disappears with it) or keeps this admission
+     * fence after destructive cleanup starts. The runtime advisory lock owns
+     * execution, so a failed/interrupted teardown can always be retried.
      */
     deletionInProgress: boolean("deletion_in_progress").notNull().default(false),
+    /** Set after workers quiesce, before destruction. Retained through cleanup retries. */
+    lifecycleOperation: jsonb("lifecycle_operation").$type<ProjectLifecycleOperation | null>(),
     /** Internal transfer journal; never accepted as a project setting. */
     cloudPromotion: jsonb("cloud_promotion").$type<ProjectCloudPromotion | null>(),
 
@@ -498,6 +528,7 @@ export const project = pgTable(
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
   (table) => [
+    uniqueIndex("project_owner_unique").on(table.id, table.organizationId),
     check("project_workspace_target_check", sql`${table.workspaceId} IS NULL OR (${table.serverId} IS NOT NULL AND ${table.clusterId} IS NULL)`),
     foreignKey({ columns: [table.workspaceId, table.organizationId], foreignColumns: [cloudWorkspace.id, cloudWorkspace.organizationId], name: "project_workspace_owner_fk" }).onDelete("restrict"),
     foreignKey({ columns: [table.serverId, table.workspaceId, table.organizationId], foreignColumns: [servers.id, servers.workspaceId, servers.organizationId], name: "project_server_workspace_fk" }).onDelete("restrict"),

@@ -6,6 +6,10 @@
  */
 
 export const endpoints = {
+  instance: {
+    status: "system/instance",
+    action: (action: "preflight" | "offer" | "move" | "provision" | "resume" | "cancel" | "pair" | "connect" | "disconnect" | "return") => `system/instance/${action}`,
+  },
   /* ---------------------------------------------------------------- */
   /*  Projects                                                        */
   /* ---------------------------------------------------------------- */
@@ -57,6 +61,7 @@ export const endpoints = {
     sleepMode: (id: string | number) => `projects/${id}/sleep-mode`,
     deployments: (id: string | number) => `projects/${id}/deployments`,
     logs: (id: string | number) => `projects/${id}/logs`,
+    roles: (id: string | number) => `projects/${id}/roles`,
     logsStream: (id: string | number) => `projects/${id}/logs/stream`,
     serverLogsRecent: (id: string | number) => `projects/${id}/server-logs/recent`,
     serverLogsStreamToken: (id: string | number) => `projects/${id}/server-logs/stream-token`,
@@ -196,6 +201,18 @@ export const endpoints = {
     run: (key: string) => `jobs/${encodeURIComponent(key)}/run`,
     runDetail: (runId: string) => `jobs/runs/${encodeURIComponent(runId)}`,
     runStream: (runId: string) => `jobs/runs/${encodeURIComponent(runId)}/stream`,
+  },
+
+  actions: {
+    workflows: "actions/workflows",
+    workflow: (id: string) => `actions/workflows/${encodeURIComponent(id)}`,
+    runs: "actions/runs",
+    run: (id: string) => `actions/runs/${encodeURIComponent(id)}`,
+    runners: "actions/runners",
+    runner: (id: string) => `actions/runners/${encodeURIComponent(id)}`,
+    events: (id: string) => `actions/jobs/${encodeURIComponent(id)}/events`,
+    discover: "actions/discover",
+    preview: "actions/preview",
   },
 
   /* ---------------------------------------------------------------- */
@@ -537,6 +554,8 @@ export const endpoints = {
     behind: "updates?behind=1",
     scan: "updates/scan",
     apply: (projectId: string) => `updates/${projectId}/apply`,
+    runtime: (projectId: string) => `updates/${projectId}/runtime`,
+    runtimeCheck: (projectId: string) => `updates/${projectId}/runtime/check`,
   },
 
   /* ---------------------------------------------------------------- */
@@ -545,6 +564,7 @@ export const endpoints = {
   issues: {
     open: "issues",
     resolved: "issues?status=resolved",
+    clearHistory: "issues/history",
     summary: "issues/summary",
     health: "issues/health",
     healthScan: "issues/health/scan",
@@ -600,6 +620,10 @@ export const endpoints = {
   /*  Billing (Oblien-managed — SaaS + local proxy)                  */
   /* ---------------------------------------------------------------- */
   billing: {
+    actions: "billing/actions",
+    actionsPurchase: "billing/actions/purchase",
+    actionsCheckout: "billing/actions/checkout",
+    actionsResume: "billing/actions/checkout/resume",
     checkouts: "billing/checkouts",
     checkoutResume: "billing/checkout/resume",
     checkoutCancel: "billing/checkout/cancel",

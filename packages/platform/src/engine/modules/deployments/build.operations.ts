@@ -1,6 +1,8 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
+import { join } from "node:path";
 import { assertCloudProxyScope } from "../../lib/cloud/scope";
 import { AppError, NotFoundError, ValidationError, CLOUD_UNREACHABLE_CODE } from "@repo/core";
-import { isCreateDeploymentResult, type PrepareDeploymentInput } from "@repo/contracts";
+import { isAcceptedDeploymentResult, type PrepareDeploymentInput } from "@repo/contracts";
 import type { BuildDependencies } from "../../../builds";
 import type { ExecutionContext } from "../../../context";
 import type { Source } from "./prepare.service";
@@ -24,13 +26,25 @@ async function preparationSource(ctx: ExecutionContext, body: PrepareDeploymentI
       const { ok } = await checkSourceTier(ctx, { owner: body.owner, repo: body.repo }, "content-whole", "");
       if (!ok) throw new NotFoundError("github", `${body.owner}/${body.repo}`);
     }
-    return { source, owner: body.owner, repo: body.repo, branch: body.branch, ctx, composePath, env: envVars };
+    return {
+      source,
+      owner: body.owner,
+      repo: body.repo,
+      branch: body.branch,
+      ctx,
+      composePath,
+      rootDirectory: body.rootDirectory,
+      env: envVars,
+    };
   }
   if (source === "local") {
     if (env.CLOUD_MODE) throw new AppError("Local projects are not available in cloud mode", 403);
     if (!body.path) throw new ValidationError("path is required");
-    const path = process.env.OPENSHIP_NATIVE === "true" ? await assertNativeSourcePath(body.path) : body.path;
-    return { source, path, composePath, env: envVars };
+    const native = process.env.OPENSHIP_NATIVE === "true";
+    const path = native ? await assertNativeSourcePath(body.path) : body.path;
+    // A relative folder can resolve through a symlink beyond the approved roots.
+    if (native && body.rootDirectory) await assertNativeSourcePath(join(path, body.rootDirectory));
+    return { source, path, composePath, rootDirectory: body.rootDirectory, env: envVars };
   }
   throw new ValidationError("source must be 'github' or 'local'");
 }
@@ -50,9 +64,9 @@ export const buildDependencies: BuildDependencies = {
       assertCloudProxyScope(ctx);
       const response = await cloudFetchAsOrgOwner(ctx.organizationId, "/api/deployments/build/access", { method: "POST", body: JSON.stringify(input) });
       if (!response) throw new AppError("Openship Cloud is unreachable", 503, CLOUD_UNREACHABLE_CODE);
-      const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+      const body = await response.json().catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/build.operations"); return null; }) as Record<string, unknown> | null;
       if (!response.ok) throw new AppError(typeof body?.error === "string" ? body.error : typeof body?.message === "string" ? body.message : "Cloud deployment failed", response.status, typeof body?.code === "string" ? body.code : undefined);
-      if (!isCreateDeploymentResult(body)) throw new AppError("Invalid cloud build response", 502, "INVALID_CLOUD_RESPONSE");
+      if (!isAcceptedDeploymentResult(body)) throw new AppError("Invalid cloud build response", 502, "INVALID_CLOUD_RESPONSE");
       return body;
     }
     const service = await import("./build.service");

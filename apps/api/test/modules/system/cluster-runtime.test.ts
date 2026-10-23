@@ -238,6 +238,11 @@ describe("managed cluster runtime", () => {
   });
   it("starts saved controls before waiting for quorum and verifies real services before readiness", async () => {
     const row = record();
+    h.authorize.mockImplementation(async (_ctx, serverId) => ({
+      name: `Server ${serverId}`,
+      sshHost: `${serverId}.example`,
+      isLocal: serverId === "c",
+    }));
     await runClusterRuntime(ctx, row);
     expect(h.install.mock.calls.map((call) => call[1].host.serverId)).toEqual(["a", "b", "c"]);
     expect(h.install.mock.calls[0]![2]).toBeUndefined();

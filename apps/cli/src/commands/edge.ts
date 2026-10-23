@@ -32,6 +32,7 @@
  * delegate through the API's import endpoint rather than writing vhosts by hand.
  */
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Command } from "commander";
 import chalk from "chalk";
 import { intro, outro, select, isCancel, note, text, password, confirm, log } from "@clack/prompts";
@@ -39,6 +40,7 @@ import { intro, outro, select, isCancel, note, text, password, confirm, log } fr
 import { getRemoteClient, ApiError } from "../lib/ship-client";
 import { iteratePages } from "@repo/sdk/client";
 import { CreateDomainInputSchema, parseInput, isRecord, type Domain, type DomainRecords, type RouteRule } from "@repo/contracts";
+import { attachCustomDomainEndpoint } from "../lib/custom-domain-endpoint";
 import { positiveInteger } from "../lib/command-input";
 import { printEvents } from "../lib/event-output";
 import { spin, fail } from "../lib/cmd-helpers";
@@ -177,6 +179,7 @@ async function runRepair(mode: RepairMode): Promise<never> {
     const res = await repairEdgeConflict(mode, apiPort(), onLog);
     reportRepair(res);
   } catch (e) {
+    observeCaughtError(e, "cli/commands/edge");
     sp?.fail("Edge repair failed");
     fail(e);
   }
@@ -255,6 +258,7 @@ async function scanSites(): Promise<void> {
       info("\n  Import them with `openship edge migrate` (takes over :80/:443, keeps them serving).");
     }
   } catch (e) {
+    observeCaughtError(e, "cli/commands/edge");
     sp?.fail("Scan failed");
     fail(e);
   }
@@ -335,7 +339,8 @@ async function apiLivePing(): Promise<boolean> {
   try {
     const res = await getRemoteClient().http.raw("/health", { signal: AbortSignal.timeout(1500) });
     return res.ok;
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "cli/commands/edge");
     return false;
   }
 }
@@ -485,22 +490,19 @@ async function panelTraffic(entry: DomainEntry): Promise<void> {
     let bwIn = 0;
     let bwOut = 0;
     let rtSum = 0;
-    let rtN = 0;
     const countries: Record<string, number> = {};
     for (const b of buckets) {
       requests += b.requests || 0;
       bwIn += b.bandwidthIn || 0;
       bwOut += b.bandwidthOut || 0;
-      if (b.responseTime) {
-        rtSum += b.responseTime;
-        rtN++;
-      }
+      // responseTime is the minute's total (seconds), not its average.
+      rtSum += b.responseTime || 0;
       for (const [cc, n] of Object.entries(b.countries ?? {})) countries[cc] = (countries[cc] || 0) + Number(n);
     }
     info(`  Traffic — ${entry.hostname}  ${chalk.dim("(last hour · server-scoped)")}`);
     info(`  Requests:   ${fmtInt(requests)}`);
     info(`  Bandwidth:  ↓ ${fmtBytes(bwIn)}   ↑ ${fmtBytes(bwOut)}`);
-    info(`  Avg resp:   ${Math.round((rtN ? rtSum / rtN : 0) * 1000)} ms`);
+    info(`  Avg resp:   ${Math.round((requests ? rtSum / requests : 0) * 1000)} ms`);
     const top = Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 5);
     if (top.length) info(`  Top countries: ${top.map(([c, n]) => `${c}=${fmtInt(n)}`).join("   ")}`);
   } catch (e) {
@@ -571,7 +573,8 @@ async function panelTrafficOverview(): Promise<void> {
         requests += b.requests || 0;
         bwOut += b.bandwidthOut || 0;
       }
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "cli/commands/edge");
       rows.push({ domain: d.hostname, port: d.port != null ? `:${d.port}` : "—", requests: "Unavailable", out: "Unavailable" });
       continue;
     }
@@ -690,6 +693,7 @@ async function panelRules(entry: DomainEntry): Promise<void> {
       if (act === "add") await panelAddRule(entry);
       else if (act === "rm") await panelRemoveRule(entry, relevant);
     } catch (e) {
+      observeCaughtError(e, "cli/commands/edge");
       renderPanelError(e);
     }
   }
@@ -725,6 +729,7 @@ async function panelRegisterDomain(): Promise<void> {
   try {
     const res = await registerDomainCore(hostname, opts);
     sp?.succeed(res.verified ? `DNS verified for ${hostname}` : `Registered ${hostname}`);
+    if (!isJsonMode() && res.routed) info(`  ${res.domain.hostname} is configured to be routed on the next deploy.`);
     if (res.verified) {
       if (res.sslStatus) info(`  SSL: ${res.sslStatus}`);
     } else if (res.records) {
@@ -772,6 +777,7 @@ async function panelDomainActions(entry: DomainEntry): Promise<void> {
       else if (act === "rules") await panelRules(entry);
       else if (act === "rm" && (await panelRemoveDomain(entry))) return;
     } catch (e) {
+      observeCaughtError(e, "cli/commands/edge");
       renderPanelError(e);
     }
   }
@@ -806,6 +812,7 @@ async function panelDomains(): Promise<void> {
       try {
         await panelRegisterDomain();
       } catch (e) {
+        observeCaughtError(e, "cli/commands/edge");
         renderPanelError(e);
       }
       continue;
@@ -828,7 +835,7 @@ function edgeHeader(diag: EdgeDiagnosis | null, apiLive: boolean, domainsLabel: 
 async function edgePanel(): Promise<void> {
   intro(`${chalk.bgCyan(chalk.black(" Openship "))}${chalk.dim(" edge")}`);
   for (;;) {
-    const diag = IS_LINUX ? await diagnoseEdge().catch(() => null) : null;
+    const diag = IS_LINUX ? await diagnoseEdge().catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "cli/commands/edge"); return null; }) : null;
     const apiLive = await apiLivePing();
 
     // The edge CLI is a trusted local tool: on a desktop / loopback box the API is
@@ -842,6 +849,7 @@ async function edgePanel(): Promise<void> {
       try {
         domainsLabel = String((await loadDomains()).length);
       } catch (e) {
+        observeCaughtError(e, "cli/commands/edge");
         if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
           needsAuth = true;
           domainsLabel = chalk.yellow("auth required");
@@ -901,6 +909,7 @@ async function edgePanel(): Promise<void> {
       else if (action === "sites") await panelSites();
       else if (action === "monitoring") await panelMonitoring();
     } catch (e) {
+      observeCaughtError(e, "cli/commands/edge");
       renderPanelError(e);
     }
   }
@@ -932,6 +941,7 @@ const rulesList = new Command("list")
         ["id", "path", "domain", "enabled", "rules"],
       );
     } catch (e) {
+      observeCaughtError(e, "cli/commands/edge");
       fail(e);
     }
   });
@@ -979,6 +989,7 @@ const rulesAdd = new Command("add")
       sp?.succeed(`Added rule ${rule.id}`);
       if (isJsonMode()) printJson(rule);
     } catch (e) {
+      observeCaughtError(e, "cli/commands/edge");
       sp?.fail("Add failed");
       fail(e);
     }
@@ -995,6 +1006,7 @@ const rulesRm = new Command("rm")
       sp?.succeed(`Deleted rule ${ruleId}`);
       if (isJsonMode()) printJson({ success: true });
     } catch (e) {
+      observeCaughtError(e, "cli/commands/edge");
       sp?.fail("Delete failed");
       fail(e);
     }
@@ -1043,6 +1055,7 @@ const domainsList = new Command("list")
         ["id", "hostname", "type", "primary", "verified", "ssl"],
       );
     } catch (e) {
+      observeCaughtError(e, "cli/commands/edge");
       fail(e);
     }
   });
@@ -1063,6 +1076,7 @@ interface DomainAddOpts {
  * (per-domain analytics need domain→project→server).
  */
 interface RegisterResult {
+  routed: boolean;
   domain: Domain;
   records?: DomainRecords;
   verified: boolean;
@@ -1100,6 +1114,7 @@ async function registerDomainCore(hostname: string, opts: DomainAddOpts): Promis
 
   const added = await ship.domains.create(projectId!, input);
   const domain = added.domain;
+  const routed = await attachCustomDomainEndpoint(ship, projectId!, domain.hostname);
 
   let verified = false;
   let sslStatus: string | undefined;
@@ -1109,7 +1124,7 @@ async function registerDomainCore(hostname: string, opts: DomainAddOpts): Promis
     sslStatus = vbody.sslStatus;
   }
 
-  return { domain, records: added.records, verified, sslStatus, projectId };
+  return { domain, records: added.records, verified, sslStatus, projectId, routed };
 }
 
 async function runDomainAdd(hostname: string, opts: DomainAddOpts): Promise<void> {
@@ -1118,6 +1133,7 @@ async function runDomainAdd(hostname: string, opts: DomainAddOpts): Promise<void
   try {
     const res = await registerDomainCore(hostname, opts);
     sp?.succeed(res.verified ? `DNS verified for ${host}` : `Registered ${host}`);
+    if (!isJsonMode() && res.routed) info(`  ${res.domain.hostname} is configured to be routed on the next deploy.`);
     if (isJsonMode()) {
       printJson({ domain: res.domain, records: res.records, verified: res.verified, sslStatus: res.sslStatus, projectId: res.projectId });
       return;
@@ -1129,6 +1145,7 @@ async function runDomainAdd(hostname: string, opts: DomainAddOpts): Promise<void
       if (res.records) printRecords(res.records);
     }
   } catch (e) {
+    observeCaughtError(e, "cli/commands/edge");
     sp?.fail("Register failed");
     fail(e);
   }
@@ -1150,18 +1167,19 @@ async function runDomainRm(hostname: string, opts: { project: string }): Promise
     sp?.succeed(`Removed ${host}`);
     if (isJsonMode()) printJson({ success: true, id: match.id, hostname: host });
   } catch (e) {
+    observeCaughtError(e, "cli/commands/edge");
     sp?.fail("Remove failed");
     fail(e);
   }
 }
 
 const domainsAdd = new Command("add")
-  .description("Register a hostname on the edge, bound to a port (auto-verifies SSL)")
+  .description("Register a hostname for routing on the next deploy (auto-verifies SSL)")
   .argument("<hostname>", "Domain hostname (e.g. app.example.com)")
   .option("-p, --project <id>", "Attach to an existing project (uses its target port)")
   .option("--port <n>", "Bind a new tracked project to 127.0.0.1:<n>", positiveInteger)
   .option("--primary", "Mark this domain as the project's primary", false)
-  .option("--no-verify", "Skip DNS verification + SSL issuance (just claim the hostname)")
+  .option("--no-verify", "Skip DNS verification + SSL issuance (still configure routing)")
   .action((hostname: string, opts) => runDomainAdd(hostname, opts));
 
 const domainsRm = new Command("rm")
@@ -1213,6 +1231,7 @@ const logsCommand = new Command("logs")
       else printLogRows(rows);
 
     } catch (e) {
+      observeCaughtError(e, "cli/commands/edge");
       fail(e);
     }
   });
@@ -1256,6 +1275,7 @@ async function runTraffic(opts: TrafficOpts): Promise<void> {
       );
     }
   } catch (e) {
+    observeCaughtError(e, "cli/commands/edge");
     fail(e);
   }
 }
@@ -1313,6 +1333,7 @@ async function runGeo(opts: GeoOpts): Promise<void> {
     const statuses = Object.entries(g.statuses ?? {});
     if (statuses.length) info(`\n  Statuses:  ${statuses.map(([k, v]) => `${k}=${fmtInt(v)}`).join("   ")}`);
   } catch (e) {
+    observeCaughtError(e, "cli/commands/edge");
     fail(e);
   }
 }
@@ -1356,7 +1377,8 @@ async function detectExistingInstall(): Promise<{
       signal: AbortSignal.timeout(2000),
     });
     apiLive = res.ok;
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "cli/commands/edge");
     // not live — leave apiLive false
   }
   return { present: svc.installed || method !== null || apiLive, method, running: svc.running, apiLive };
@@ -1373,7 +1395,8 @@ async function ensureEdgeBestEffort(): Promise<void> {
     } else if (!diag.healthy) {
       info(chalk.dim("        Edge isn't serving — `openship edge up` repairs it."));
     }
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "cli/commands/edge");
     // best-effort only
   }
 }
@@ -1470,6 +1493,7 @@ async function provisionMonitoring(opts: InstallOpts): Promise<never> {
   try {
     await runMonitoringInstall(opts);
   } catch (e) {
+    observeCaughtError(e, "cli/commands/edge");
     fail(e);
   }
   process.exit(0);

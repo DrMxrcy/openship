@@ -97,7 +97,7 @@ def inspect():
     if shutil.disk_usage('/var/lib').free < 5 * 1024**3: raise RuntimeError('At least 5 GB of free disk space is required for the runtime.')
     cg = pathlib.Path('/sys/fs/cgroup/cgroup.controllers')
     # The kubelet refuses cgroup v1 hosts, so K3s would crash-loop after install.
-    if not cg.exists(): raise RuntimeError('This server boots with cgroup v1, which Kubernetes no longer supports. Set systemd.unified_cgroup_hierarchy=1 on the kernel command line (remove any =0 setting), reboot, then retry.')
+    if not cg.exists(): raise RuntimeError('This server boots with cgroup v1. Managed K3s setup requires cgroup v2. Set systemd.unified_cgroup_hierarchy=1 on the kernel command line (remove any =0 setting), reboot, then retry.')
     if not {'memory', 'pids'}.issubset(set(cg.read_text().split())): raise RuntimeError('Enable memory and process cgroup controllers before setup.')
     nics = links()
     matched = [nic for nic in nics if any(addr.get('local') == C['host']['privateIp'] for addr in nic.get('addr_info', []))]
@@ -204,13 +204,24 @@ def configure():
         token.unlink()
         config.update({'server': 'https://' + C['bootstrapIp'] + ':6443', 'token-file': str(ROOT / 'join.token')})
     if CONFIG.exists():
-        try: same_config = json.loads(CONFIG.read_text()) == config
-        except (ValueError, OSError): same_config = False
-        if not same_config: raise RuntimeError('The existing runtime configuration has changed outside this setup. Review it before retrying.')
+        try:
+            existing = CONFIG.read_bytes()
+            previous = json.loads(existing)
+        except (ValueError, OSError):
+            existing, previous = b'', None
+        if previous != config:
+            legacy = dict(config); legacy.pop('egress-selector-mode', None)
+            if (host['role'] != 'server' or previous != legacy or
+                    value.get('configHash') != hashlib.sha256(existing).hexdigest()):
+                raise RuntimeError('The existing runtime configuration has changed outside this setup. Review it before retrying.')
+            # Preserve the old hash until the new config is written. Interrupted installs
+            # must still retry the migration and restart the service with the new setting.
+            value['restartRequired'] = True
+            atomic(OWNER, json.dumps(value))
     content = json.dumps(config)
+    atomic(CONFIG, content)
     value['configHash'] = hashlib.sha256(content.encode()).hexdigest()
     atomic(OWNER, json.dumps(value))
-    atomic(CONFIG, content)
     guard(value)
     binary()
     env = {key: val for key, val in os.environ.items() if not key.startswith(('K3S_', 'INSTALL_K3S_'))}
@@ -224,8 +235,9 @@ def configure():
     if not firewall.is_file(): raise RuntimeError('The private firewall configuration is missing.')
     atomic('/etc/systemd/system/' + unit + '.service.d/openship.conf', '[Service]\nExecStartPre=/bin/sh ' + str(firewall) + '\n')
     run(['systemctl', 'daemon-reload']); run(['systemctl', 'enable', unit])
-    run(['systemctl', 'start', '--no-block', unit])
+    run(['systemctl', 'restart' if value.get('restartRequired') else 'start', '--no-block', unit])
     value = owner()
+    value.pop('restartRequired', None)
     value['installed'] = True
     atomic(OWNER, json.dumps(value))
     return {'installed': True}
@@ -233,26 +245,36 @@ def configure():
 def kubectl(args, timeout=30):
     return run([str(BIN), 'kubectl', '--kubeconfig=/etc/rancher/k3s/k3s.yaml', '--server=https://' + C['host']['privateIp'] + ':6443', '--request-timeout=20s'] + args, timeout)
 
-def service_detail(unit):
+def service_detail(unit, limit=2000):
     # Fatal lines explain a crash loop; etcd/raft chatter in the last few lines does not.
-    status = run(['systemctl', 'show', unit, '--property=ActiveState,NRestarts', '--value']).split()
-    lines = run(['journalctl', '-u', unit, '-n', '400', '--no-pager', '-o', 'cat']).splitlines()
-    fatal = [line for line in lines if re.match(r'(Error: |F\d{4} |time=\S+ level=(fatal|error) )', line)]
-    detail = ' | '.join(fatal[-3:]) if fatal else ' '.join(lines[-12:])
-    return 'Service is ' + (status[0] if status else 'unknown') + ' after ' + (status[1] if len(status) > 1 else '?') + ' restarts. ' + detail
+    try:
+        properties = run(['systemctl', 'show', unit, '--property=ActiveState,NRestarts'])
+        status = dict(line.split('=', 1) for line in properties.splitlines() if '=' in line)
+    except Exception: status = {}
+    try:
+        lines = run(['journalctl', '-u', unit, '-n', '400', '--no-pager', '-o', 'cat']).splitlines()
+        fatal = [line for line in lines if re.match(r'(Error: |F\d{4} |time=\S+ level=(fatal|error) )', line)]
+        detail = ' | '.join(fatal[-3:]) if fatal else ' '.join(lines[-12:])
+    except Exception as error: detail = 'Service logs unavailable: ' + str(error)
+    detail = re.sub(r'K10\S+', '[redacted]', detail)
+    summary = 'Service is ' + status.get('ActiveState', 'unknown') + ' after ' + status.get('NRestarts', '?') + ' restarts. '
+    remaining = max(0, limit - len(summary))
+    return summary[:limit] + (detail[-remaining:] if remaining else '')
 
 def readiness():
     value = owner()
     if not value: raise RuntimeError('The owned runtime installation is missing.')
     unit = 'k3s' if C['host']['role'] == 'server' else 'k3s-agent'
     status = run(['systemctl', 'show', unit, '--property=ActiveState', '--value']).strip()
-    if status != 'active': return {'ready': False, 'message': service_detail(unit)[-2000:]}
+    if status != 'active': return {'ready': False, 'message': service_detail(unit)}
     if C['host']['role'] == 'server':
         try:
             kubectl(['get', '--raw=/readyz'])
             uid = json.loads(kubectl(['get', 'namespace', 'kube-system', '-o', 'json']))['metadata']['uid']
             return {'ready': True, 'clusterUid': uid}
-        except Exception as error: return {'ready': False, 'message': (str(error) + ' ' + service_detail(unit))[-2000:]}
+        except Exception as error:
+            cause = str(error)[-1000:]
+            return {'ready': False, 'message': cause + ' ' + service_detail(unit, 1999 - len(cause))}
     return {'ready': True}
 
 def assert_empty():

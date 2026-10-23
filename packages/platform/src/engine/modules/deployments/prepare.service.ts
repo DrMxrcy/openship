@@ -5,6 +5,8 @@
  * No database writes, no deployment logic.
  */
 
+import { assertRuntimeVersionTarget, normalizeRuntimeImageOverride, runtimeProjectUpdate, resolveRuntimeImages, ValidationError } from "@repo/core";
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import * as githubService from "../github/github.service";
 import type { ExecutionContext as RequestContext } from "@repo/platform";
 import { MANIFEST_FILES, type RepoFile, type StackResult } from "../../lib/stack-detector";
@@ -34,6 +36,7 @@ import {
 } from "../../lib/project-root-detector";
 import {
   parseDeploymentMetadata,
+  vercelCompatibilityWarnings,
   parseOpenshipConfig,
   METADATA_FILES,
   type ProjectType,
@@ -45,9 +48,14 @@ import {
   type OpenshipResources,
   type OpenshipReadiness,
   type OpenshipMonorepoApp,
+  type StackRole,
+  type StackDefinition,
   type ComposeAdvanced,
   type WorkloadType,
   resolveTierResources,
+  STACKS,
+  resolveStackRoles,
+  runtimeRoleDefinition,
 } from "@repo/core";
 import { env } from "../../config/index";
 import { createGitHubReader, type ProjectReader } from "./project-reader";
@@ -87,6 +95,8 @@ export type Source =
       rootDirectory?: string;
       /** See {@link ResolveOptions.env}. */
       env?: Record<string, string>;
+      /** See {@link ResolveOptions.expectCompose}. */
+      expectCompose?: boolean;
     }
   | {
       source: "local";
@@ -95,6 +105,8 @@ export type Source =
       rootDirectory?: string;
       /** See {@link ResolveOptions.env}. */
       env?: Record<string, string>;
+      /** See {@link ResolveOptions.expectCompose}. */
+      expectCompose?: boolean;
     };
 
 export interface ResolveOptions {
@@ -124,6 +136,15 @@ export interface ResolveOptions {
    * file as unparseable even though the deploy would have succeeded (#383).
    */
   env?: Record<string, string>;
+  /**
+   * The project already deploys Compose services (a services project, or one
+   * with imported Compose rows). The Compose file found at the root is parsed
+   * even when stack detection picks another stack, so a root that also holds a
+   * Vite config and a Dockerfile cannot drop those services (#1020). Native
+   * openship.json services retain priority over inferred Compose. Root selection
+   * is unchanged, and an app scan still leaves local-dev Compose alone (#959).
+   */
+  expectCompose?: boolean;
 }
 
 /** Thrown when a declared `composePath` has no compose file behind it. */
@@ -214,6 +235,8 @@ export interface ProjectInfo {
   installCommand: string;
   startCommand: string;
   buildImage: string;
+  runtimeVersion?: string;
+  runtimeImage?: string;
   outputDirectory: string;
   rootDirectory: string;
   /**
@@ -276,6 +299,14 @@ export interface ProjectInfo {
    * Absent means no release phase, which is the default for every project.
    */
   releaseCommands?: string[];
+  /**
+   * Declared runtime roles (queue workers, a scheduler) that run from the same
+   * image as the web app. Absent means web only; a declared `[]` means
+   * explicitly no roles, which is why the overlay tests for presence.
+   */
+  roles?: StackRole[];
+  /** Matching framework suggestions. Enabling a role always requires an explicit selection. */
+  rolePresets?: StackRole[];
   /**
    * What the selected `openship.json` parse REFUSED, when it refused anything (#641).
    * Advisory only: an invalid config has never failed a scan or a deploy, it just
@@ -402,6 +433,8 @@ function extractOpenshipConfig(fileContents: Record<string, string>): ExtractedO
   }
 
   const { config, errors, warnings } = parseOpenshipConfig(raw);
+  const runtimeErrors = errors.filter((error) => error.startsWith("runtimeVersion:") || error.startsWith("runtimeImage:"));
+  if (runtimeErrors.length) throw new ValidationError(runtimeErrors.join(" · "));
   // Only a non-object root nulls the config — every field-level failure still
   // yields a partial config that overlays. So `!config` is the whole-file case,
   // and the flag says so without the message having to.
@@ -465,15 +498,19 @@ function splitDomain(host: string): {
  */
 function toAdvancedResources(
   r: OpenshipResources | undefined,
-): { cpuCores?: number; memoryMb?: number } | undefined {
+): { cpuCores?: number; memoryMb?: number; swapDisabled?: boolean } | undefined {
   if (!r) return undefined;
   const base = r.tier ? resolveTierResources(r.tier) : undefined;
   const cpuCores = r.cpuCores ?? base?.cpuCores;
   const memoryMb = r.memoryMb ?? base?.memoryMb;
-  if (cpuCores === undefined && memoryMb === undefined) return undefined;
+  const swapDisabled = r.swapDisabled;
+  if (cpuCores === undefined && memoryMb === undefined && swapDisabled === undefined) {
+    return undefined;
+  }
   return {
     ...(cpuCores !== undefined && { cpuCores }),
     ...(memoryMb !== undefined && { memoryMb }),
+    ...(swapDisabled !== undefined && { swapDisabled }),
   };
 }
 
@@ -555,6 +592,17 @@ function applyOpenshipOverlay(info: ProjectInfo, config: OpenshipConfig | undefi
   if (config.packageManager) info.packageManager = config.packageManager;
   if (config.rootDirectory) info.rootDirectory = config.rootDirectory;
   if (config.buildImage) info.buildImage = config.buildImage;
+  if (config.runtimeImage !== undefined) {
+    assertRuntimeVersionTarget({ runtimeImage: config.runtimeImage, framework: info.stack, projectType: info.projectType, runtimeMode: config.runtime, composePath: info.composePath, workloadType: config.workload });
+    info.runtimeImage = normalizeRuntimeImageOverride(config.runtimeImage) ?? undefined;
+    runtimeProjectUpdate({ framework: info.stack, buildImage: info.buildImage }, { runtimeImage: config.runtimeImage, runtimeVersion: config.runtimeVersion });
+  }
+  if (config.runtimeVersion !== undefined) {
+    assertRuntimeVersionTarget({ runtimeVersion: config.runtimeVersion, framework: info.stack, projectType: info.projectType, runtimeMode: config.runtime, composePath: info.composePath, workloadType: config.workload });
+    const runtime = resolveRuntimeImages(info.stack, config.runtimeVersion, config.buildImage, config.runtimeImage);
+    info.runtimeVersion = runtime.runtimeVersion;
+    info.buildImage = runtime.buildImage;
+  }
   if (config.productionPaths) info.productionPaths = config.productionPaths;
   // Declared `[]` is meaningful (persistence off), so test for presence, not truth.
   if (config.volumes) info.volumes = config.volumes;
@@ -576,6 +624,8 @@ function applyOpenshipOverlay(info: ProjectInfo, config: OpenshipConfig | undefi
   if (config.readiness) info.readiness = config.readiness;
   // Declared `[]` is meaningful (release phase off), so test for presence.
   if (config.releaseCommands) info.releaseCommands = config.releaseCommands;
+  // Same presence test: a declared `[]` opts out of the stack's role presets.
+  if (config.roles) info.roles = config.roles;
 
   // Declared compose services replace detection: the project IS a services
   // project. runtimeMode="docker" then falls out of buildProductionProjectInput's
@@ -656,6 +706,8 @@ export function projectInfoToScanResponse(result: ProjectInfo, options: SourceSc
     buildCommand: publicInfo.buildCommand,
     startCommand: publicInfo.startCommand,
     buildImage: publicInfo.buildImage,
+    ...(publicInfo.runtimeVersion && { runtimeVersion: publicInfo.runtimeVersion }),
+    ...(publicInfo.runtimeImage && { runtimeImage: publicInfo.runtimeImage }),
     outputDirectory: publicInfo.outputDirectory,
     rootDirectory: publicInfo.rootDirectory,
     ...(publicInfo.composePath && { composePath: publicInfo.composePath }),
@@ -675,6 +727,13 @@ export function projectInfoToScanResponse(result: ProjectInfo, options: SourceSc
     ...(publicInfo.resources && { resources: publicInfo.resources }),
     ...(publicInfo.readiness && { readiness: publicInfo.readiness }),
     ...(publicInfo.releaseCommands && { releaseCommands: publicInfo.releaseCommands }),
+    // parseRoles rejects kind "web", which the wire contract's `kind` also excludes.
+    ...(publicInfo.roles && {
+      roles: publicInfo.roles as (StackRole & { kind: "worker" | "scheduler" })[],
+    }),
+    ...(publicInfo.rolePresets && {
+      rolePresets: publicInfo.rolePresets as (StackRole & { kind: "worker" | "scheduler" })[],
+    }),
     ...(publicInfo.configDiagnostics && { configDiagnostics: publicInfo.configDiagnostics }),
     ...(publicInfo.rootEnv &&
       Object.keys(publicInfo.rootEnv).length > 0 && {
@@ -699,15 +758,63 @@ async function readProjectSnapshot(
 ): Promise<ProjectRootSnapshotInput> {
   const normalizedRootDirectory = normalizeProjectRootDirectory(rootDirectory);
   const files = await reader.listDirectory(normalizedRootDirectory);
+  // Detectors can declare nested markers (for example bin/rails). Read their
+  // names beside an existing root marker, without walking or exposing contents.
+  // The same listing provides file gates for that stack's role suggestions.
+  const names = new Set(files.map((file) => file.name.toLowerCase()));
+  const nested = [
+    ...new Set(
+      Object.values(STACKS).flatMap((stack: StackDefinition) => {
+        if (
+          !stack.detection?.rootMarkers?.some(
+            (marker) => !marker.includes("/") && names.has(marker.toLowerCase()),
+          )
+        )
+          return [];
+        return [
+          ...stack.detection.rootMarkers,
+          ...(stack.defaultRoles ?? []).flatMap((role) => [
+            ...(role.when?.files ?? []),
+            ...(role.unless?.files ?? []),
+          ]),
+        ].filter((name) => name.includes("/") && names.has(name.split("/")[0].toLowerCase()));
+      }),
+    ),
+  ];
+  const parents = [...new Set(nested.map((name) => name.slice(0, name.lastIndexOf("/"))))];
+  const children = new Map(
+    await Promise.all(
+      parents.map(
+        async (parent) =>
+          [
+            parent,
+            await reader.listDirectory(joinProjectPath(normalizedRootDirectory, parent)),
+          ] as const,
+      ),
+    ),
+  );
+  for (const name of nested) {
+    const slash = name.lastIndexOf("/");
+    if (
+      children
+        .get(name.slice(0, slash))
+        ?.some((file) => file.name === name.slice(slash + 1) && file.type !== "dir")
+    ) {
+      files.push({ name, type: "file" });
+    }
+  }
   const packageJson = await reader.readJson(
     joinProjectPath(normalizedRootDirectory, "package.json"),
   );
   const fileContents: Record<string, string> = {};
 
   await Promise.all(
-    PREPARE_FILE_CONTENTS.filter((name) =>
-      files.some((file) => file.name.toLowerCase() === name.toLowerCase()),
-    ).map(async (name) => {
+    files.filter((file) =>
+      file.type === "file" &&
+      PREPARE_FILE_CONTENTS.some((name) => file.name.toLowerCase() === name.toLowerCase()),
+    ).map(async ({ name }) => {
+      // Match known manifests case-insensitively, but read the actual path.
+      // Linux and GitHub distinguish Dockerfile from dockerfile.
       const content = await reader.readText(joinProjectPath(normalizedRootDirectory, name));
       if (content) {
         fileContents[name] = content;
@@ -764,7 +871,7 @@ async function selectProjectSnapshot(
   reader: ProjectReader,
   rootSnapshot: ProjectRootSnapshotInput,
 ): Promise<SelectedProjectSnapshot> {
-  const treeEntries = await reader.listTree().catch(() => [] as RepoTreeEntry[]);
+  const treeEntries = await reader.listTree().catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/prepare.service"); return [] as RepoTreeEntry[]; });
   const hints = discoverProjectRootHints(
     treeEntries,
     rootSnapshot.fileContents,
@@ -863,6 +970,7 @@ export async function resolveProjectInfo(input: Source): Promise<ProjectInfo> {
       composePath: input.composePath,
       rootDirectory: input.rootDirectory,
       env: input.env,
+      expectCompose: input.expectCompose,
     });
   }
 
@@ -876,6 +984,7 @@ export async function resolveProjectInfo(input: Source): Promise<ProjectInfo> {
     composePath: input.composePath,
     rootDirectory: input.rootDirectory,
     env: input.env,
+    expectCompose: input.expectCompose,
   });
 }
 
@@ -967,6 +1076,11 @@ export async function resolveFromReader(
   opts: ResolveOptions = {},
 ): Promise<ProjectInfo> {
   const rootSnapshot = await readProjectSnapshot(reader, opts.rootDirectory);
+  if (opts.rootDirectory !== undefined && rootSnapshot.files.length === 0) {
+    throw new ValidationError(
+      "The selected app folder is empty or could not be read. Check the folder and repository access, then try again.",
+    );
+  }
   // A saved build directory need not contain the project's manifest: existing
   // projects can declare services, env, and composePath at the repository root.
   // Prefer a subfolder manifest by presence, not parse success, so a malformed
@@ -988,7 +1102,7 @@ export async function resolveFromReader(
   const declaredComposePath = opts.composePath?.trim() || openship.config?.composePath?.trim();
   const root = declaredComposePath
     ? await resolveDeclaredRoot(reader, declaredComposePath)
-    : rootSnapshot.rootDirectory
+    : opts.rootDirectory !== undefined
       ? {
           selected: buildProjectRootSnapshot(rootSnapshot),
           monorepo: null,
@@ -996,10 +1110,17 @@ export async function resolveFromReader(
         }
       : await resolveDetectedRoot(reader, rootSnapshot);
 
+  // Native service definitions replace detection. Decide before parsing so an
+  // unused development Compose file cannot block them or add its required env
+  // into the native scan. An explicitly selected Compose path still validates.
+  const useNativeServices = !root.declaredComposePath && !!openship.config?.services?.length;
+
   // `.env` sits next to the compose file, which is what compose itself resolves
   // against — for a declared root that is the pinned directory, not the repo root.
   const [composeContent, composeEnvContent] = await Promise.all([
-    readComposeText(reader, root.selected.rootDirectory, root.composeFiles),
+    useNativeServices
+      ? undefined
+      : readComposeText(reader, root.selected.rootDirectory, root.composeFiles),
     readProjectText(reader, root.selected.rootDirectory, ".env"),
   ]);
   if (root.declaredComposePath && !composeContent) {
@@ -1017,7 +1138,9 @@ export async function resolveFromReader(
     root.monorepo,
     routing,
     {
-      declaredCompose: !!root.declaredComposePath,
+      declaredCompose:
+        !!root.declaredComposePath ||
+        (opts.expectCompose === true && !useNativeServices && root.composeFiles.length > 0),
       // `openship.json.env` is the repository's explicit shared environment
       // layer. Let it resolve Compose fields during the same source read; an
       // environment supplied by the deploy request remains the higher-priority
@@ -1029,17 +1152,43 @@ export async function resolveFromReader(
     },
   );
   if (openship.diagnostics) info.configDiagnostics = openship.diagnostics;
+  const vercelRaw = Object.entries(configSnapshot.fileContents ?? {}).find(
+    ([name]) => name.toLowerCase() === "vercel.json",
+  )?.[1];
+  if (vercelRaw) {
+    const warnings = vercelCompatibilityWarnings(vercelRaw);
+    if (warnings.length) {
+      info.configDiagnostics ??= { errors: [], warnings: [] };
+      info.configDiagnostics.warnings.push(...warnings);
+    }
+  }
   const overlaid = applyOpenshipOverlay(info, openship.config);
+  // A scan suggests roles; it must not start a queue or scheduler implicitly,
+  // including when the destination cannot run roles. Explicit [] is an opt-out.
+  const presets = (STACKS[overlaid.stack] as StackDefinition).defaultRoles;
+  if (
+    overlaid.roles === undefined &&
+    presets?.length &&
+    !overlaid.services?.length &&
+    !root.monorepo
+  ) {
+    const roles = resolveStackRoles({
+      defaultRoles: presets,
+      deps: Object.keys(root.selected.stack.dependencies),
+      files: root.selected.files.map((file) => file.name),
+    });
+    if (roles.length) overlaid.rolePresets = roles.map(runtimeRoleDefinition);
+  }
   // Log both syntax diagnostics and overrides rejected by workspace discovery.
   // Scans expose the same diagnostics to SDK, CLI and dashboard callers.
   if (overlaid.configDiagnostics) {
-    console.warn(
-      `[openship.json] ${repoMeta.full_name}: ` +
+    errorDiagnostics.warn("platform/engine/modules/deployments/prepare.service",
+      `[deployment config] ${repoMeta.full_name}: ` +
         [...overlaid.configDiagnostics.errors, ...overlaid.configDiagnostics.warnings].join(" · "),
     );
   }
 
-  if (root.declaredComposePath || rootSnapshot.rootDirectory) {
+  if (root.declaredComposePath || opts.rootDirectory !== undefined) {
     // The compose directory IS this project's root — it anchors every relative
     // `build:` context. A saved project directory is authoritative too; neither
     // can be relocated by an openship.json default after the source was read.
@@ -1128,6 +1277,7 @@ function toProjectInfo(
       // of the file quietly deploying as something else (#533).
       if (parsed.unsupported.length > 0) unsupportedCompose = parsed.unsupported;
     } catch (err) {
+      observeCaughtError(err, "platform/engine/modules/deployments/prepare.service");
       // Surface the broken file — an unusable file (invalid YAML), which is all
       // the parser throws for now. Swallowing it returns a services project with
       // ZERO services — the wizard then shows nothing to deploy and no reason

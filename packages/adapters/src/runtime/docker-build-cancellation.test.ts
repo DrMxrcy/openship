@@ -1,3 +1,4 @@
+import { stubProtectedBuildWorker } from "../../test/fixtures/remote-build-worker";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -59,6 +60,9 @@ function buildConfig(sessionId: string): BuildConfig {
 // one test's cancel pre-abort another's build.
 describe("DockerRuntime build cancellation", () => {
   function runtimeWith(executor: CommandExecutor, extra?: Record<string, unknown>) {
+    const hostExec = executor.exec.bind(executor);
+    executor.exec = vi.fn(async (command, options) => command.includes("df -Pk")
+      ? "104857600 52428800\n100000\n" : hostExec(command, options));
     const verifyImageBuilt = vi.fn(async () => {});
     const cloneSourceOnRemote = vi.fn(async () => {});
     const runtime = Object.create(DockerRuntime.prototype) as DockerRuntime &
@@ -68,6 +72,7 @@ describe("DockerRuntime build cancellation", () => {
       transport: { kind: "ssh", description: "test ssh" },
       systemManager: null,
       _docker: {
+        modem: { dial: (_options: unknown, callback: (error: unknown, data: unknown) => void) => callback(null, {}) },
         listContainers: vi.fn(async () => []),
       },
       cloneSourceOnRemote,
@@ -78,6 +83,7 @@ describe("DockerRuntime build cancellation", () => {
       verifyImageBuilt,
       ...extra,
     });
+    stubProtectedBuildWorker(runtime);
     return { runtime, verifyImageBuilt, cloneSourceOnRemote };
   }
 

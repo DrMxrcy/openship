@@ -105,21 +105,25 @@ describe("custom plan presentation", () => {
 
 describe("plan comparison", () => {
   it("keeps the cards focused on resources and places shared information below the comparison", () => {
-    const plans = (["hobby", "starter", "pro", "team"] as const).map((id) => ({
+    const plans = (["starter", "pro", "team"] as const).map((id) => ({
       ...PLANS[id], features: [...PLANS[id].features], resourceLimits: PLANS[id].oblienLimits,
       listPrice: { monthly: PLANS[id].price.monthly }, effectivePrice: { monthly: PLANS[id].price.monthly }, campaign: null,
     }));
     const out = render(<PricingCards plans={plans} ui={ui} />);
     const cards = [...out.matchAll(/<article\b[^>]*>[\s\S]*?<\/article>/g)].map(([card]) => text(card));
     const copy = baseDictionary.billing.resourcesGuide;
-    expect(cards).toHaveLength(4);
+    expect(cards).toHaveLength(3);
     for (const card of cards) {
-      expect(card).toContain(copy.buildTime);
-      expect(card).toContain(copy.buildIncluded);
+      expect(card).toContain("vCPU");
+      expect(card).toContain("RAM");
+      expect(card).toContain("Storage");
+      expect(card).toContain(copy.concurrentBuilds);
+      expect(card).not.toContain(copy.buildIncluded);
       expect(card).not.toMatch(/credits|Shared across|More features/i);
     }
     for (const [index, card] of cards.entries()) {
-      for (const feature of plans[index]!.features) expect(card).not.toContain(feature);
+      expect(card).toContain(String(plans[index]!.limits.maxProjects));
+      expect(card).toContain(String(plans[index]!.limits.runningServices));
     }
     const compute = baseDictionary.billing.compute;
     for (const note of [...Object.values(compute.features), compute.extras])

@@ -27,9 +27,14 @@ export const SourceScanSchema = Type.Object({
   outputDirectory: Type.String(), rootDirectory: Type.String(),
   port: Type.Optional(Type.Number()), productionPaths: Type.Optional(Type.Array(Type.String())),
   productionMode: Type.Optional(Type.String()), workloadType: Type.Optional(Type.String()), runtimeMode: Type.Optional(Type.String()),
+  runtimeVersion: EnsureProjectBody.properties.runtimeVersion,
+  runtimeImage: EnsureProjectBody.properties.runtimeImage,
   composePath: Type.Optional(Type.String()), volumes: EnsureProjectBody.properties.volumes,
   routing: EnsureProjectBody.properties.routingConfig,
   releaseCommands: EnsureProjectBody.properties.releaseCommands,
+  roles: EnsureProjectBody.properties.roles,
+  /** Detected suggestions only; never enabled by scanning a source. */
+  rolePresets: EnsureProjectBody.properties.roles,
   services: Type.Optional(Type.Array(Type.Object({
     ...BuildServiceInput.properties,
     commandArgv: Type.Optional(Type.Union([Type.Array(Type.String()), Type.Null()])),

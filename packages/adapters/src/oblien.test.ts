@@ -2,6 +2,41 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Oblien, cloudWorkspaceCreationFailure } from "./oblien";
 afterEach(() => vi.unstubAllGlobals());
 describe("Oblien SDK transport", () => {
+  it.each(["3", new Date(Date.now() + 30_000).toUTCString()])("preserves a gateway throttle and Retry-After %s without exposing its HTML", async (retryAfter) => {
+    const fetcher = vi.fn(async () => new Response("<html>private gateway data</html>", {
+      status: 429, headers: { "Retry-After": retryAfter },
+    }));
+    vi.stubGlobal("fetch", fetcher);
+    const error = await new Oblien({ token: "test" }).workspaces.create({ wait_ready: false }).catch(error => error);
+    expect(error).toMatchObject({ status: 429, code: "OBLIEN_RATE_LIMITED" });
+    expect(error.details.retryAfterSeconds).toBeGreaterThan(0);
+    expect(error.details.retryAfterSeconds).toBeLessThanOrEqual(30);
+    expect(error.message).toContain("Retry after");
+    expect(error.message).not.toContain("private");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it.each(["invalid", "-1", "99999999999999999999999"])("ignores invalid Retry-After %s", async (retryAfter) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 503, headers: { "Retry-After": retryAfter } })));
+    const error = await new Oblien({ token: "test" }).workspaces.get("ws").catch(error => error);
+    expect(error.status).toBe(503);
+    expect(error.details).toBeUndefined();
+  });
+  it("reads the provider egress pool from its fixed endpoint and strips credentials", async () => {
+    const fetcher = vi.fn(async (_url: unknown) => Response.json({ success: true, proxies: [
+      { ip: "8.8.4.4", country_code: "US", username: "pool-user", password: "pool-password", internal_id: "private-id" },
+      { ip: "8.8.4.4", country_code: "US" },
+      { ip: "1.1.1.1", country_code: null },
+    ] }));
+    vi.stubGlobal("fetch", fetcher);
+    const choices = await new Oblien({ token: "fixture-token" }).listOutboundIps();
+    expect(choices).toEqual([{ ip: "8.8.4.4", countryCode: "US" }, { ip: "1.1.1.1", countryCode: null }]);
+    expect(String(fetcher.mock.calls[0]?.[0])).toBe("https://api.oblien.com/zone/mine");
+    expect(JSON.stringify(choices)).not.toMatch(/pool-user|pool-password|private-id/);
+  });
+  it("rejects an unreadable pool instead of presenting a successful empty picker", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ success: true, proxies: [{ ip: "not-an-ip", password: "private-password" }] })));
+    await expect(new Oblien({ token: "fixture-token" }).listOutboundIps()).rejects.toMatchObject({ code: "OBLIEN_OUTBOUND_OPTIONS_INVALID" });
+  });
   it("propagates an HTTP quota refusal even without success:false", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: "NAMESPACE_LIMIT_REACHED" }, { status: 409 })));
     const client = new Oblien({ token: "scoped-test-token" });

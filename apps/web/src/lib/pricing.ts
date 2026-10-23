@@ -1,3 +1,4 @@
+import { reportCaughtError } from "@repo/core/diagnostics";
 import { cache } from "react";
 import { CLOUD_API_URL, pricingUi, resolveStandard } from "@repo/core";
 import { BillingPlansSchema, parseInput, type BillingPlans } from "@repo/contracts";
@@ -11,6 +12,7 @@ export interface CloudPricing {
   available: boolean;
   tiers: PricedPlan[];
   customTiers: CloudPlan[];
+  management?: BillingPlans["management"];
 }
 
 /** A single public catalog feeds checkout, the dashboard, and marketing.
@@ -29,15 +31,17 @@ export const getCloudPricing = cache(async (): Promise<CloudPricing> => {
     const body = await response.json();
     const data = parseInput(BillingPlansSchema, body.data);
     const tiers = data.plans.filter(
-      (plan): plan is PricedPlan => plan.price.monthly !== null && plan.price.monthly > 0,
+      (plan): plan is PricedPlan => plan.price.monthly !== null && plan.price.monthly > 0 && plan.availableForPurchase !== false,
     );
     if (data.provider !== "oblien" || !tiers.length) throw new Error("Cloud plans unavailable");
     return {
       available: true,
+      management: data.management,
       tiers,
       customTiers: data.plans.filter((plan) => plan.price.monthly === null),
     };
-  } catch {
+  } catch (error) {
+    reportCaughtError(error, "web/lib/pricing");
     return { available: false, tiers: [], customTiers: [] };
   }
 });

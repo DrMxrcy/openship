@@ -20,7 +20,7 @@ import { projectClusterCommand, projectDatabaseCommand, projectVolumeCommand } f
 import {
   projectUpdateCommand, projectEnvironmentCommand, projectResourcesCommand,
   projectStorageCommand, projectConnectionsCommand, projectInspectionCommands,
-  projectOptionsCommand, projectCacheCommand, projectDeploymentsCommand, projectCloneCommand, projectLocalCommand, projectRoutingCommand,
+  projectRoleConfigurationCommand, projectOptionsCommand, projectCacheCommand, projectDeploymentsCommand, projectCloneCommand, projectLocalCommand, projectRoutingCommand,
 } from "./project-management";
 import {
   renderReleaseImage,
@@ -37,7 +37,8 @@ function action(fn: (...args: any[]) => Promise<void>) {
       await fn(...args);
     } catch (e) {
       rethrowCommandExit(e);
-      if (e instanceof ApiError) err(`  ${e.message}`);
+      // A bare 401 ("Unauthorized") means no token or a rejected one; say how to fix it.
+      if (e instanceof ApiError) err(`  ${e.message}${e.status === 401 ? "\n  Run `openship login` first." : ""}`);
       else err(`  ${e instanceof Error ? e.message : String(e)}`);
       process.exitCode = 1;
     }
@@ -308,6 +309,7 @@ envCmd
   .command("set")
   .description("Merge env vars: upsert KEY=VALUE pairs and/or delete keys")
   .argument("<id>", "Project ID")
+  .argument("[pairs...]", "KEY=VALUE pairs to upsert (same as --set)")
   .option("--environment <env>", "Target environment", "production")
   .option(
     "--set <pair>",
@@ -321,14 +323,14 @@ envCmd
     collect,
     [] as string[],
   )
-  .option("--secret", "Mark every --set value as a secret")
+  .option("--secret", "Mark every upserted value as a secret")
   .action(
-    action(async (id: string, opts) => {
+    action(async (id: string, pairs: string[], opts) => {
       const environment = parseOptionalEnvironmentScope(opts.environment) ?? "production";
-      const upserts = Object.entries(parsePairs(opts.set)).map(([key, value]) => ({ key, value, isSecret: !!opts.secret }));
+      const upserts = Object.entries(parsePairs([...pairs, ...opts.set])).map(([key, value]) => ({ key, value, isSecret: !!opts.secret }));
       const deletes = opts.unset as string[];
       if (upserts.length === 0 && deletes.length === 0) {
-        err("  Nothing to do — pass --set and/or --unset.");
+        err("  Nothing to do — pass KEY=VALUE pairs, --set and/or --unset.");
         process.exitCode = 1;
         return;
       }
@@ -542,11 +544,20 @@ const logsCmd = new Command("logs")
   .description("Show or stream runtime (container) logs")
   .argument("<id>", "Project ID")
   .option("--tail <n>", "Number of recent lines", positiveInteger)
+  .option("--role <name>", "Read one active runtime role instead of the web application")
+  .option("--replica <n>", "Role replica number (defaults to 1)", positiveInteger)
+  .option("--deployment-id <id>", "Reject logs if this deployment is no longer active")
   .option("-f, --follow", "Stream logs until interrupted")
   .action(
     action(async (id: string, opts) => {
+      const target = {
+        tail: opts.tail,
+        role: opts.role,
+        replica: opts.replica,
+        deploymentId: opts.deploymentId,
+      };
       if (!opts.follow) {
-        const data = await getShipClient().projects.runtimeLogs(id, { tail: opts.tail });
+        const data = await getShipClient().projects.runtimeLogs(id, target);
         if (isJsonMode()) {
           printJson(data);
           return;
@@ -555,7 +566,7 @@ const logsCmd = new Command("logs")
         return;
       }
 
-      for await (const ev of getShipClient().projects.streamRuntimeLogs(id, { tail: opts.tail })) {
+      for await (const ev of getShipClient().projects.streamRuntimeLogs(id, target)) {
         if (ev.event === "error") {
           const parsed = safeParse(ev.data);
           err(`  ${(parsed?.error as string) ?? ev.data}`);
@@ -644,6 +655,6 @@ projectCommand.addCommand(serverLogsCmd);
 projectCommand.addCommand(projectClusterCommand);
 projectCommand.addCommand(projectDatabaseCommand);
 projectCommand.addCommand(projectVolumeCommand);
-for (const command of [projectOptionsCommand, projectCacheCommand, projectDeploymentsCommand, projectCloneCommand, projectLocalCommand, projectRoutingCommand]) projectCommand.addCommand(command);
+for (const command of [projectRoleConfigurationCommand, projectOptionsCommand, projectCacheCommand, projectDeploymentsCommand, projectCloneCommand, projectLocalCommand, projectRoutingCommand]) projectCommand.addCommand(command);
 for (const command of [projectUpdateCommand, projectEnvironmentCommand, projectResourcesCommand,
   projectStorageCommand, projectConnectionsCommand, ...projectInspectionCommands]) projectCommand.addCommand(command);

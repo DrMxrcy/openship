@@ -12,6 +12,7 @@ const {
   getLatestCommit,
   requireClusterDeploymentTarget,
   kickoffBuild,
+  queueActionDeployment,
   repos,
   resolveProjectInfo,
   resolveProjectSourceEnv,
@@ -30,7 +31,10 @@ const {
   getLatestCommit: vi.fn(),
   requireClusterDeploymentTarget: vi.fn(),
   kickoffBuild: vi.fn(),
+  queueActionDeployment: vi.fn(),
   repos: {
+    routeProtection: { list: vi.fn(async () => []) },
+    actions: { deploymentForActionRequest: vi.fn() },
     projectConnection: { listByTarget: vi.fn(async () => []) },
     project: {
       findById: vi.fn(),
@@ -42,6 +46,7 @@ const {
       update: vi.fn(),
     },
     deployment: {
+      listPendingRoleHandovers: vi.fn(async () => []),
       findById: vi.fn(),
       findInProgressByCommit: vi.fn(),
       listInFlightByProject: vi.fn(),
@@ -87,6 +92,8 @@ vi.mock("@repo/db", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   repos,
 }));
+
+vi.mock("@repo/platform/engine/modules/actions/deployment-gate", () => ({ queueActionDeployment }));
 
 vi.mock("@repo/platform/engine/modules/deployments/preflight", () => ({
   runPreflightChecks,
@@ -339,6 +346,15 @@ function releaseSnapshot(
 }
 
 describe("buildConfigSnapshot", () => {
+  it("defaults new static snapshots to Pages and freezes an explicit managed-server choice", () => {
+    const project = baseProject({ workloadType: "static", hasServer: false });
+    const pages = buildConfigSnapshot(project);
+    expect(pages.cloudStaticHosting).toBe("pages");
+    const server = buildConfigSnapshot({ ...project, cloudStaticHosting: "server" });
+    expect(server.cloudStaticHosting).toBe("server");
+    project.cloudStaticHosting = "server";
+    expect(pages.cloudStaticHosting).toBe("pages");
+  });
   it.each(["web", "worker"])("keeps the full Ruby builder image for a %s runtime", (workloadType) => {
     const snapshot = buildConfigSnapshot(baseProject({
       framework: "rails", packageManager: "bundler", buildImage: "ruby:3.4.1-alpine",
@@ -602,9 +618,46 @@ describe("buildConfigSnapshot — release commands", () => {
   });
 });
 
+/**
+ * Runtime roles (#935) follow the release-commands rule: frozen only when the
+ * project has some, so a project without roles snapshots byte-identical to
+ * before. when/unless are preset gating and never reach a snapshot.
+ */
+describe("buildConfigSnapshot: roles", () => {
+  const worker = { name: "jobs", kind: "worker", command: "bin/jobs", replicas: 2 };
+
+  it("freezes the project's declared roles onto the snapshot", () => {
+    const scheduler = { name: "cron", kind: "scheduler", command: "bin/cron", singleton: true };
+    const snapshot = buildConfigSnapshot(baseProject({ roles: [worker, scheduler] }) as any);
+    expect(snapshot.roles).toEqual([worker, scheduler]);
+  });
+
+  it("omits the key entirely for null, [] and a project that never declared any", () => {
+    for (const roles of [null, [], undefined]) {
+      const snapshot = buildConfigSnapshot(baseProject({ roles }) as any);
+      expect("roles" in snapshot).toBe(false);
+    }
+  });
+
+  it("never carries the preset-only when/unless fields", () => {
+    const snapshot = buildConfigSnapshot(
+      baseProject({
+        roles: [
+          { ...worker, when: { deps: ["solid_queue"] }, unless: { deps: ["sidekiq"] } },
+        ],
+      }) as any,
+    );
+    expect(snapshot.roles).toEqual([worker]);
+    expect(snapshot.roles?.[0]).not.toHaveProperty("when");
+    expect(snapshot.roles?.[0]).not.toHaveProperty("unless");
+  });
+});
+
 describe("triggerDeployment", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    queueActionDeployment.mockReset().mockResolvedValue(undefined);
+    repos.actions.deploymentForActionRequest.mockReset().mockResolvedValue(undefined);
     repos.deployment.listInFlightByProject.mockResolvedValue([]);
 
     repos.project.findById.mockResolvedValue(baseProject());
@@ -645,6 +698,110 @@ describe("triggerDeployment", () => {
     });
     runPreflightChecks.mockResolvedValue({ ok: true, checks: [] });
     kickoffBuild.mockResolvedValue("session-1");
+  });
+
+  it.each(
+    ["manual", "retry", "latest retry"].flatMap((entry) =>
+      ["compose", "single"].map((mode) => ({ entry, mode })),
+    ),
+  )(
+    "keeps $mode source configuration at the selected commit during $entry",
+    async ({ entry, mode }) => {
+      const sha = "a".repeat(40);
+      const project = baseProject({
+        gitProvider: "github",
+        gitOwner: "acme",
+        gitRepo: "app",
+        gitUrl: "https://github.com/acme/app.git",
+        localPath: null,
+        framework: mode === "compose" ? "docker-compose" : "node",
+        composePath: mode === "compose" ? "compose.production.yml" : null,
+      });
+      repos.project.findById.mockResolvedValue(project);
+      const currentEnv = { MANUAL_ENV: encrypt("current-setting") };
+      repos.project.getEnvMap.mockResolvedValue(currentEnv);
+      const state =
+        mode === "compose" ? installStatefulComposeRepo(criticalApiService()) : undefined;
+      resolveProjectInfo.mockImplementation(async ({ branch }) => {
+        // HEAD has since removed the deployment's Compose file. Reading it
+        // must not block rebuilding the selected commit where it still exists.
+        if (branch !== sha)
+          throw new ComposeConfigurationError("Compose file no longer exists at HEAD");
+        return {
+          services: [{ ...criticalApiService(), image: "example/api:selected-commit" }],
+          openshipEnv: { SOURCE_DEFAULT: "selected-commit" },
+        };
+      });
+      resolveProjectSourceEnv.mockImplementation(async ({ branch }) => ({
+        openshipEnv: { SOURCE_DEFAULT: branch === sha ? "selected-commit" : "wrong-head" },
+      }));
+      const actualPipeline = await vi.importActual<
+        typeof import("@repo/platform/engine/modules/deployments/build-pipeline")
+      >("@repo/platform/engine/modules/deployments/build-pipeline");
+      resolveServicePipelineMode.mockImplementation(actualPipeline.resolveServicePipelineMode);
+      if (entry === "manual") {
+        await triggerDeployment(ctx, { projectId: project.id, branch: "main", commitSha: sha });
+      } else {
+        repos.deployment.findById.mockResolvedValue({
+          id: "dep-old",
+          projectId: project.id,
+          organizationId: project.organizationId,
+          branch: "main",
+          environment: "production",
+          commitSha: sha,
+          envVars: { MANUAL_ENV: encrypt("old-release-setting") },
+          meta: {
+            ...baseSnapshot(),
+            localPath: undefined,
+            repoUrl: project.gitUrl,
+            serviceDeploymentMode: mode === "single" ? "single" : "services",
+          },
+        });
+        if (entry === "latest retry")
+          getLatestCommit.mockResolvedValueOnce({ sha, message: "selected commit" });
+        await redeployBuildSession(ctx, "dep-old", { useExistingCommit: entry === "retry" });
+      }
+      const queued = repos.deployment.create.mock.calls.at(-1)![0];
+      expect(queued).toMatchObject({ branch: "main", commitSha: sha });
+      expect(decrypt(queued.envVars.SOURCE_DEFAULT)).toBe("selected-commit");
+      expect(decrypt(queued.envVars.MANUAL_ENV)).toBe("current-setting");
+      if (mode === "compose") {
+        expect(state!.stored().image).toBe("example/api:selected-commit");
+        expect(queued.meta.composeServices).toEqual([
+          expect.objectContaining({ image: "example/api:selected-commit" }),
+        ]);
+      } else {
+        expect(resolveProjectInfo).not.toHaveBeenCalled();
+      }
+      expect(kickoffBuild).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("returns a required-check receipt without starting a deployment or reconciling configuration", async () => {
+    queueActionDeployment.mockResolvedValue({ id: "receipt-1", status: "waiting" });
+    const result = await triggerDeployment(ctx, { projectId: "project-1", trigger: "webhook", branch: "main", commitSha: "a".repeat(40) });
+    expect(result).toMatchObject({ awaitingActions: { id: "receipt-1" }, skipped: true });
+    expect(repos.deployment.create).not.toHaveBeenCalled();
+    expect(resolveProjectInfo).not.toHaveBeenCalled();
+    expect(kickoffBuild).not.toHaveBeenCalled();
+  });
+
+  it("uses the checked commit for Compose and lifecycle reads before the normal deployment pipeline", async () => {
+    const sha = "a".repeat(40);
+    repos.project.findById.mockResolvedValue(baseProject({ gitOwner: "acme", gitRepo: "app", gitUrl: "https://github.com/acme/app", gitProvider: "github", localPath: null }));
+    await triggerDeployment(ctx, { projectId: "project-1", trigger: "actions", branch: "main", commitSha: sha, actionRequestId: "receipt-1", actionLeaseOwner: "controller-1" });
+    expect(resolveProjectInfo).toHaveBeenCalledWith(expect.objectContaining({ branch: sha }));
+    expect(repos.deployment.create).toHaveBeenCalledWith(expect.objectContaining({ branch: "main", commitSha: sha, actionRequestId: "receipt-1" }), undefined, "controller-1");
+    expect(kickoffBuild).toHaveBeenCalledOnce();
+  });
+
+  it("recovers queue submission for an accepted Actions deployment without creating another one", async () => {
+    const existing = { id: "dep-accepted", projectId: "project-1", status: "queued" };
+    repos.actions.deploymentForActionRequest.mockResolvedValue(existing);
+    const result = await triggerDeployment(ctx, { projectId: "project-1", trigger: "actions", actionRequestId: "receipt-1", actionLeaseOwner: "controller-2" });
+    expect(result.deployment).toEqual(existing);
+    expect(repos.deployment.create).not.toHaveBeenCalled();
+    expect(kickoffBuild).toHaveBeenCalledWith(expect.objectContaining({ id: "project-1" }), existing);
   });
 
   it.each(["trigger", "refresh", "build-access"])(
@@ -873,6 +1030,74 @@ describe("triggerDeployment", () => {
     },
   );
 
+  it.each([null, "  "])(
+    "reconciles an imported Compose project behind app markers with an unset path %j (#1020)",
+    async (composePath) => {
+      const localPath = mkdtempSync(join(tmpdir(), "openship-compose-app-markers-"));
+      try {
+        writeFileSync(
+          join(localPath, "package.json"),
+          JSON.stringify({ devDependencies: { vite: "^6.0.0" } }),
+        );
+        writeFileSync(join(localPath, "vite.config.ts"), "export default {};\n");
+        writeFileSync(join(localPath, "Dockerfile"), "FROM node:22-alpine\n");
+        writeFileSync(
+          join(localPath, "compose.yaml"),
+          [
+            "services:",
+            "  web:",
+            "    build: .",
+            "    environment:",
+            "      SOURCE_VALUE: refreshed",
+          ].join("\n"),
+        );
+        const baseline = { ...composeServices[0], buildArgs: {}, environment: {} };
+        const state = installStatefulComposeRepo({
+          ...baseline,
+          projectId: "project-1",
+          environment: { OPERATOR_VALUE: "keep-me" },
+          importedSpec: toComposeSpec(baseline),
+        });
+        repos.project.findById.mockResolvedValue(
+          baseProject({
+            framework: "docker",
+            composePath,
+            localPath,
+          }),
+        );
+        const actualPrepare = await vi.importActual<
+          typeof import("@repo/platform/engine/modules/deployments/prepare.service")
+        >("@repo/platform/engine/modules/deployments/prepare.service");
+        resolveProjectInfo.mockImplementationOnce(actualPrepare.resolveProjectInfo);
+        const actualPipeline = await vi.importActual<
+          typeof import("@repo/platform/engine/modules/deployments/build-pipeline")
+        >("@repo/platform/engine/modules/deployments/build-pipeline");
+        resolveServicePipelineMode.mockImplementationOnce(
+          actualPipeline.resolveServicePipelineMode,
+        );
+
+        await triggerDeployment(ctx, { projectId: "project-1" });
+
+        expect(state.stored().environment).toEqual({
+          SOURCE_VALUE: "refreshed",
+          OPERATOR_VALUE: "keep-me",
+        });
+        expect(repos.service.reconcileFromCompose).toHaveBeenCalledOnce();
+        expect(repos.deployment.create).toHaveBeenCalledOnce();
+        expect(repos.deployment.create.mock.calls[0]![0].meta.composeServices).toEqual([
+          expect.objectContaining({
+            name: "web",
+            build: ".",
+            environment: { SOURCE_VALUE: "refreshed", OPERATOR_VALUE: "keep-me" },
+          }),
+        ]);
+        expect(kickoffBuild).toHaveBeenCalledOnce();
+      } finally {
+        rmSync(localPath, { recursive: true, force: true });
+      }
+    },
+  );
+
   it.each([
     { framework: "node", importedSpec: toComposeSpec(composeServices[0]) },
     { framework: "unknown", importedSpec: null },
@@ -896,6 +1121,11 @@ describe("triggerDeployment", () => {
       try {
         mkdirSync(join(localPath, "go-api"));
         writeFileSync(join(localPath, "go-api", "Dockerfile"), "FROM node:22-alpine\n");
+        // This belongs to local development, not the native production services.
+        writeFileSync(
+          join(localPath, "go-api", "compose.yaml"),
+          "services:\n  dev-db:\n    image: postgres:16\n    network_mode: host\n",
+        );
         const config = {
           rootDirectory: manifestLocation === "repository" ? "go-api" : "./",
           env: { API_URL: "https://source.example.com" },
@@ -1031,6 +1261,41 @@ describe("triggerDeployment", () => {
     });
 
     expect(resolveProjectInfo).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { entry: "smart redeploy", trigger: "manual", smartRoute: true, explicit: false, strict: false, wholeApp: true },
+    { entry: "push", trigger: "webhook", smartRoute: false, explicit: true, strict: false, wholeApp: true },
+    { entry: "exact hook", trigger: "webhook", smartRoute: false, explicit: true, strict: true, wholeApp: false },
+    { entry: "service action", trigger: "manual", smartRoute: false, explicit: true, strict: false, wholeApp: false },
+  ])("keeps primary-app release/role orchestration during $entry without broadening an explicit scope", async ({ trigger, smartRoute, explicit, strict, wholeApp }) => {
+    const targets = ["svc-app", "svc-db"];
+    repos.service.listByProject.mockResolvedValue(targets.map(id => ({ id, name: id, enabled: true, advanced: null })));
+    resolveServicePipelineMode.mockResolvedValue({
+      useServicePipeline: false,
+      useSingleAppPipeline: false,
+      primaryApp: { app: { id: "svc-app", name: "app" }, infrastructure: [{ id: "svc-db" }] },
+      servicePreflightServices: [
+        { name: "app", kind: "monorepo" },
+        { name: "db", kind: "compose", image: "postgres:16" },
+      ],
+    });
+    resolveSmartRoute.mockResolvedValue({ forceAll: false, serviceIds: targets, changedPaths: ["src/app.php"] });
+    await triggerDeployment(ctx, {
+      projectId: "project-1", trigger, smartRoute,
+      ...(explicit ? { serviceIds: targets } : {}),
+      strictServiceScope: strict,
+    });
+    const saved = repos.deployment.create.mock.calls.at(-1)![0];
+    expect(saved.meta).toMatchObject({ primaryAppServiceName: "app" });
+    if (wholeApp) {
+      expect(saved.meta.targetServiceIds).toBeUndefined();
+      expect(saved.meta.refreshServiceIds).toBeUndefined();
+      expect(saved.forceAll).toBe(true);
+    } else {
+      expect(saved.meta.targetServiceIds).toEqual(targets);
+      if (strict) expect(saved.meta.strictServiceScope).toBe(true);
+    }
   });
 
   it.each(["webhook", "update"])("persists the exact service scope for an %s deployment", async (trigger) => {
@@ -1210,7 +1475,7 @@ describe("triggerDeployment", () => {
         source: "github",
         owner: "acme",
         repo: "app",
-        branch: "main",
+        branch: commitSha,
         composePath: "deploy/stack.yml",
         rootDirectory: "deploy",
       }),
@@ -1944,7 +2209,7 @@ describe("redeployBuildSession environment snapshot", () => {
     );
   });
 
-  it("refreshes missing Cloud app defaults before freezing a failed installation's retry", async () => {
+  it("keeps missing service limits unset when freezing a Cloud app retry", async () => {
     const project = baseProject({
       appTemplateId: "supabase",
       isApp: true,
@@ -1990,7 +2255,10 @@ describe("redeployBuildSession environment snapshot", () => {
       services: queued.meta.composeServices.map((service: { advanced: { resources: ResourceValues } }) => ({
         resources: service.advanced.resources,
       })),
-    })).toEqual({ cpuCores: 4, memoryMb: 8192, diskMb: 40960 });
+    })).toEqual({ cpuCores: 0.25, memoryMb: 1024, diskMb: 8192 });
+    expect(repos.service.seedDraftAppResourceDefaults).not.toHaveBeenCalled();
+    expect(queued.meta.composeServices.every((service: { advanced: { resources?: ResourceValues } }) =>
+      service.advanced.resources === undefined)).toBe(true);
     expect(queued.envVars).toEqual({ MANUAL_ENV: "keep-me" });
     expect(queued.meta.composeServices.every((service: { advanced: { stopGracePeriod: string } }) =>
       service.advanced.stopGracePeriod === "30s")).toBe(true);

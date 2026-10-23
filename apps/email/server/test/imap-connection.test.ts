@@ -40,12 +40,16 @@ afterAll(() => {
 afterEach(() => mock.restore());
 
 type Reply = "success" | "AUTHENTICATIONFAILED" | "UNAVAILABLE" | "disconnect";
-async function localImap(mode: "tls" | "starttls" | "plaintext", reply: Reply = "success") {
+async function localImap(
+  mode: "tls" | "starttls" | "plaintext",
+  reply: Reply = "success",
+  commandLogDelayMs = 0,
+) {
   // Node supplies the fixture server so Bun's server-side STARTTLS emulation
   // cannot hide a problem in the production Bun IMAP client.
   const child = spawn(
     "node",
-    [join(import.meta.dir, "fixtures/imap-server.mjs"), mode, reply, dir],
+    [join(import.meta.dir, "fixtures/imap-server.mjs"), mode, reply, dir, String(commandLogDelayMs)],
     { stdio: ["pipe", "pipe", "pipe"] },
   );
   const credentials: string[] = [];
@@ -113,10 +117,61 @@ const auth = (port = 993) => ({
 });
 
 describe("webmail over real local IMAP sockets", () => {
+  it("keeps the authenticated SSE response alive beyond Bun's ordinary idle timeout", async () => {
+    const fixture = await localImap("tls");
+    routeTo(fixture.port);
+    const { default: application } = await import("../src/main");
+    const { saveSession, deleteSession } = await import("../src/lib/session");
+    const { env } = await import("../src/env");
+    const session = await saveSession({
+      email: "idle-runtime@example.test", password: "test-only-password",
+      imapHost: "mail.example.test", imapPort: 993,
+      smtpHost: "mail.example.test", smtpPort: 587,
+    });
+    const http = Bun.serve({ ...application, port: 0, idleTimeout: 1 });
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await fetch(`http://127.0.0.1:${http.port}/mail/idle?view=inbox`, {
+        headers: { Cookie: `${env.SESSION_COOKIE_NAME}=${session.id}` },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('X-Accel-Buffering')).toBe('no');
+      reader = response.body!.getReader();
+      const ready = await reader.read();
+      expect(new TextDecoder().decode(ready.value)).toContain('event: mailbox');
+      // Bun's timeout sweep runs in four-second steps. No heartbeat is due
+      // for 25 seconds, so an ordinary one-second timeout would close here.
+      await Bun.sleep(4500);
+      expect(http.pendingRequests).toBe(1);
+      const health = await fetch(`http://127.0.0.1:${http.port}/health`);
+      expect(health.status).toBe(200);
+      for (const { query, mailbox } of [
+        { query: 'view=bin', mailbox: 'Trash' },
+        { query: 'view=draft', mailbox: 'Drafts' },
+        { query: 'view=starred', mailbox: 'INBOX' },
+        { query: 'folder=Personal', mailbox: 'Personal' },
+      ]) {
+        const mapped = await fetch(`http://127.0.0.1:${http.port}/mail/idle?${query}`, {
+          headers: { Cookie: `${env.SESSION_COOKIE_NAME}=${session.id}` },
+        });
+        const mappedReader = mapped.body!.getReader();
+        try {
+          const event = await mappedReader.read();
+          expect(new TextDecoder().decode(event.value)).toContain(`"folder":"${mailbox}"`);
+        } finally { await mappedReader.cancel(); }
+      }
+    } finally {
+      await reader?.cancel();
+      http.stop(true);
+      await deleteSession(session.id);
+      await fixture.close();
+    }
+  }, 15_000);
+
   it.each(["tls", "starttls"] as const)(
     "authenticates and opens the inbox using %s",
     async (mode) => {
-      const server = await localImap(mode);
+      const server = await localImap(mode, "success", 50);
       try {
         routeTo(server.port);
         const exists = await withImap(
@@ -125,6 +180,9 @@ describe("webmail over real local IMAP sockets", () => {
         );
         expect(exists).toBe(1);
         expect(server.credentials).toEqual(["\0user@example.test\0test-only-password"]);
+        // A successful socket response does not flush the child's stdout pipe.
+        const deadline = Date.now() + 1000;
+        while (!server.commands.includes("LOGOUT") && Date.now() < deadline) await Bun.sleep(5);
         expect(server.commands).toContain("LOGOUT");
         if (mode === "starttls")
           expect(server.commands.indexOf("STARTTLS")).toBeLessThan(

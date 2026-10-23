@@ -1,3 +1,4 @@
+import { isCustomerServer } from "../billing/management.service";
 /**
  * Apps catalog + one-click installer.
  *
@@ -8,10 +9,15 @@
  * aren't projects — the installer just returns the wizard route to hand off to.
  */
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { randomBytes, createHmac } from "node:crypto";
 export { installServicePorts, serviceRoutingPatch, type InstallAppRoute } from "@repo/core";
 import {
   getAppManagement,
+  appGpuRequirement,
+  resolveAppGpuMode,
+  appServiceGpuConfig,
+  appGpuEnvironment,
   getAppEndpoints,
   declaredServiceRoutes,
   defaultAppRouteLabel,
@@ -34,7 +40,7 @@ import {
   type TemplateServiceBuild,
 } from "@repo/core";
 import { getRuntimeCatalog, getTemplateForOrg, listOrgCustomApps } from "./catalog-source";
-import { appCloudConfiguration, ensureDraftAppResourceDefaults } from "./app-resource-defaults";
+import { appCloudConfiguration } from "./app-cloud-configuration";
 import type { AppHostFit, InstallAppInput } from "@repo/contracts";
 export type { InstallAppInput } from "@repo/contracts";
 import { cloudDockerResources } from "../../lib/resources";
@@ -114,6 +120,8 @@ export async function getAppCatalog(ctx: RequestContext) {
     // What the app needs from the machine — the wizard shows it against the
     // chosen destination's real capacity as an advisory recommendation.
     minResources: t.minResources,
+    gpu: appGpuRequirement(t),
+    supportsCloud: t.supportsCloud ?? true,
     // A per-org user-uploaded app — always unverified; dashboard shows the warning.
     custom: !!t.custom,
     // Not installable this version → dashboard dims it + blocks the click.
@@ -159,7 +167,7 @@ export async function getAppHostFit(
     fit: { ok: true },
   };
 
-  if (env.CLOUD_MODE && template?.kind === "template") {
+  if (env.CLOUD_MODE && template?.kind === "template" && !await isCustomerServer(ctx.organizationId, target.serverId)) {
     const configuration = await appCloudConfiguration(
       ctx.organizationId,
       template,
@@ -179,6 +187,7 @@ export async function getAppHostFit(
       await assertCloudDeploymentLimits(ctx.organizationId, configuration);
       return { ...unchecked, cloud: { resources, status: "ready" } };
     } catch (error) {
+      observeCaughtError(error, "platform/engine/modules/apps/app-install.service");
       return {
         ...unchecked,
         cloud: {
@@ -205,7 +214,7 @@ export async function getAppHostFit(
   if (target.serverId) {
     const server = await repos.server
       .getInOrganization(target.serverId, ctx.organizationId)
-      .catch(() => null);
+      .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/apps/app-install.service"); return null; });
     if (!server) return unchecked;
     isLocalTarget = await isLocalHostRow(server);
   }
@@ -390,9 +399,19 @@ export async function installApp(
   let workspaceId: string | undefined;
   // Linked Cloud servers retain their workspace on self-hosted control planes
   // too. Draft adoption must use the same owner as project creation.
-  const placement = env.CLOUD_MODE
+  const customerTarget = await isCustomerServer(ctx.organizationId, input.serverId);
+  const localPlacement = input.serverId
+    ? await workspaceForServer(ctx.organizationId, input.serverId)
+    : null;
+  const cloudTarget = (env.CLOUD_MODE && !customerTarget) || !!localPlacement?.workspace;
+  // Default Cloud placement may create the initial workspace. Refuse unsupported
+  // apps and GPU requests before invoking that write path.
+  if (template.supportsCloud === false && cloudTarget)
+    throw new AppError("This app supports self-hosted servers only. Choose a connected self-hosted server.", 400, "APP_CLOUD_UNSUPPORTED");
+  const useGpu = resolveAppGpuMode(template, input.useGpu, cloudTarget);
+  const placement = env.CLOUD_MODE && !customerTarget
     ? await resolveCloudProjectServer(ctx.organizationId, input.serverId)
-    : input.serverId ? await workspaceForServer(ctx.organizationId, input.serverId) : null;
+    : localPlacement;
   if (placement?.workspace) {
     workspaceId = placement.workspace.id;
     input = { ...input, serverId: placement.server!.id };
@@ -402,7 +421,7 @@ export async function installApp(
   // `services` project with image-backed service rows, so it can never be
   // static — a static-only tier is refused here, at the moment the operator
   // clicks Install, rather than at the deploy that follows.
-  await assertPlanAllowsServices(ctx.organizationId, workspaceId);
+  await assertPlanAllowsServices(ctx.organizationId, workspaceId, input.serverId);
 
   // Gate the operator's CHOSEN routing before the first row is written: a free
   // *.opsh.io hostname only resolves behind the Cloud edge, so a disconnected
@@ -566,15 +585,20 @@ export async function installApp(
     if (existingRow) {
       // No `routes` in the request = no decision expressed; leave the draft's
       // stored routing alone rather than silently unrouting it.
-      if ((input.routes ?? []).length > 0) {
+      if ((input.routes ?? []).length > 0 || (svc.gpus && input.useGpu !== undefined)) {
         await updateService(ctx, project.id, existingRow.id, {
-          ...serviceRoutingPatch(routing),
-          ports: installServicePorts(
+          ...((input.routes ?? []).length > 0 ? serviceRoutingPatch(routing) : {}),
+          ...(svc.gpus && input.useGpu !== undefined ? {
+            advanced: useGpu ? appServiceGpuConfig(svc, true) : { gpus: null },
+            environment: appGpuEnvironment(svc, useGpu, existingRow.environment as Record<string, string>),
+          } : {}),
+          ...((input.routes ?? []).length > 0 ? { ports: installServicePorts(
             svc.name,
             svc.ports,
             input.routes,
             existingRow.ports as string[] | null,
-          ),
+            workspaceId ? "cloud" : "server",
+          ) } : {}),
         });
       }
       continue;
@@ -598,9 +622,15 @@ export async function installApp(
     await createService(ctx, project.id, {
       name: svc.name,
       image: svc.image,
-      ports: installServicePorts(svc.name, svc.ports, input.routes),
+      ports: installServicePorts(
+        svc.name,
+        svc.ports,
+        input.routes,
+        svc.ports,
+        workspaceId ? "cloud" : "server",
+      ),
       dependsOn: svc.dependsOn ? [...svc.dependsOn] : [],
-      environment: plainEnv,
+      environment: appGpuEnvironment({ ...svc, environment: plainEnv }, useGpu),
       volumes: svc.volumes ? [...svc.volumes] : [],
       command: svc.command,
       // Structured argv bypasses the `sh -c` wrap resolveComposeCmd applies to a
@@ -608,15 +638,26 @@ export async function installApp(
       commandArgv: svc.commandArgv ? [...svc.commandArgv] : undefined,
       restart: svc.restart,
       advanced: {
-        ...(env.CLOUD_MODE && existingDraft?.resources == null && svc.resources
-          ? { resources: { ...svc.resources } }
-          : {}),
+        ...appServiceGpuConfig(svc, useGpu),
+        ...(svc.shmSize !== undefined ? { shmSize: svc.shmSize } : {}),
+        ...(svc.entrypointArgv ? { entrypoint: [...svc.entrypointArgv] } : {}),
         ...(svc.healthcheck ? { healthcheck: svc.healthcheck } : {}),
         ...(filesByService.get(svc.name)?.length
           ? { files: filesByService.get(svc.name) }
           : {}),
         ...(svc.build ? { build: resolveBuild(svc.build) } : {}),
         ...(svc.stopGracePeriod ? { stopGracePeriod: svc.stopGracePeriod } : {}),
+        // Advisory CPU/disk sizing is deliberately NOT installed, but swap
+        // behavior is a runtime guarantee rather than a recommendation — and
+        // Docker requires the memory cap that makes it enforceable.
+        ...(svc.resources?.swapDisabled
+          ? {
+              resources: {
+                memoryMb: svc.resources.memoryMb,
+                swapDisabled: true,
+              },
+            }
+          : {}),
       },
       // Routing is exactly what the operator chose — never the template's
       // `exposed` flag turned into a hostname.
@@ -657,17 +698,6 @@ export async function installApp(
   // whole production scope, so anything backfilled first would be wiped. This is what
   // makes the installer's guarantee unconditional rather than "if the first attempt ran
   // to completion".
-  if (env.CLOUD_MODE)
-    await ensureDraftAppResourceDefaults(
-      {
-        ...project,
-        organizationId: ctx.organizationId,
-        appTemplateId: template.id,
-        activeDeploymentId: null,
-        resources: existingDraft?.resources,
-      },
-      template,
-    );
   await ensureGeneratedAppSecrets(project.id, template);
 
   return { kind: "template", projectId: project.id, slug: project.slug };
@@ -782,13 +812,13 @@ export async function ensureGeneratedAppSecrets(
       if (Object.hasOwn(stored, field.key) || Object.hasOwn(storedAtProject, field.key)) continue;
       const group = field.generateGroup ?? field.jwtSecretGroup;
       if (group && blockedGroups.has(group)) {
-        console.warn(
+        errorDiagnostics.warn("platform/engine/modules/apps/app-install.service",
           `[apps] ${template.id}: ${serviceName}.${field.key} is missing, but its group "${group}" already has a value elsewhere that cannot be read — leaving it alone rather than writing a value the rest of the group would not match.`,
         );
         continue;
       }
       if (inlined.has(field.key)) {
-        console.warn(
+        errorDiagnostics.warn("platform/engine/modules/apps/app-install.service",
           `[apps] ${template.id}: ${serviceName}.${field.key} is missing and is inlined elsewhere in the template — not minting a value that its existing copies would contradict.`,
         );
         continue;
@@ -809,7 +839,7 @@ export async function ensureGeneratedAppSecrets(
   }
 
   if (written.length > 0) {
-    console.warn(
+    errorDiagnostics.warn("platform/engine/modules/apps/app-install.service",
       `[apps] ${template.id}: backfilled generated config on ${projectId}: ${written.join(", ")}`,
     );
   }
@@ -840,7 +870,8 @@ function resolveGeneratedGroups(
     if (!raw || groupValue.has(group)) continue;
     try {
       groupValue.set(group, decrypt(raw));
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "platform/engine/modules/apps/app-install.service");
       blockedGroups.add(group);
     }
   }

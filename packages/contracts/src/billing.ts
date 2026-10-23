@@ -1,8 +1,10 @@
+import { ManagementBillingOperationSchemas, ManagementPricingSchema } from "./management-billing";
 import { Type, type Static } from "@sinclair/typebox";
 import { PLAN_IDS, RESOURCE_TIER_ORDER, WORKLOAD_TYPES } from "@repo/core";
 import { BillingScopeSchema, CreateSubscriptionBody, CreateTopupBody, CustomServerResourcesSchema, PreviewSubscriptionChangeBody, ConfirmSubscriptionChangeBody, SubscriptionChangeScopeSchema } from "./billing-inputs";
 import { CloudWorkspaceResizePreviewSchema, CloudWorkspaceSchema } from "./cloud-workspaces";
 import type { ResourceOperationSchema, ScopedOperations } from "./resource-operations";
+import { ActionBillingOperationSchemas } from "./action-billing";
 
 const numberOrNull = Type.Union([Type.Number(), Type.Null()]);
 const stringOrNull = Type.Union([Type.String(), Type.Null()]);
@@ -31,6 +33,7 @@ const planLimits = Type.Object({
     cpuCores: Type.Number({ exclusiveMinimum: 0 }), memoryMb: Type.Integer({ exclusiveMinimum: 0 }),
   }, { additionalProperties: false }), Type.Null()])),
   computeMinutesPerMonth: numberOrNull, buildMinutesPerMonth: numberOrNull,
+  concurrentBuilds: Type.Optional(Type.Union([Type.Integer({ minimum: 0 }), Type.Null()])),
   freeSubdomains: numberOrNull, customDomains: numberOrNull, seats: numberOrNull,
 });
 const capacityLimit = Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]);
@@ -51,6 +54,7 @@ export const BillingCustomQuoteSchema = Type.Object({
 });
 export const BillingPlansSchema = Type.Object({
   provider: Type.Optional(Type.Literal("oblien")),
+  management: Type.Optional(ManagementPricingSchema),
   locale: Type.String(), annual: Type.Object({ enabled: Type.Boolean(), monthsFree: Type.Number() }),
   ui: Type.Record(Type.String(), Type.String()),
   computePricing: Type.Optional(Type.Object({
@@ -78,7 +82,7 @@ export const BillingPlansSchema = Type.Object({
     }, { additionalProperties: false }), { minItems: 1 }),
   }, { additionalProperties: false })),
   plans: Type.Array(Type.Object({
-    id: tier, name: Type.String(), description: Type.String(), popular: Type.Boolean(),
+    id: tier, availableForPurchase: Type.Optional(Type.Boolean()), name: Type.String(), description: Type.String(), popular: Type.Boolean(),
     billingMode: Type.Optional(Type.Union([Type.Literal("monthly"), Type.Literal("metered")])),
     configuration: planConfiguration,
     offerReference: Type.Optional(Type.String()),
@@ -146,6 +150,9 @@ export const BillingPendingCheckoutSchema = Type.Object({
   interval: Type.Union([Type.Literal("monthly"), Type.Literal("annual"), Type.Null()]),
   state: Type.Union((["open", "unconfirmed", "processing", "canceling", "unavailable"] as const).map(value => Type.Literal(value))),
   canResume: Type.Boolean(), canCancel: Type.Boolean(),
+  cancelUnavailableReason: Type.Optional(Type.Union([
+    Type.Literal("provider_unavailable"), Type.Literal("unsupported"),
+  ], { description: "Why an open payment cannot currently be canceled. A failed provider read is distinct from a checkout without supported cancellation." })),
 });
 export const BillingPendingCheckoutsSchema = Type.Object({ items: Type.Array(BillingPendingCheckoutSchema) });
 export const BillingCheckoutActionInputSchema = Type.Object({
@@ -220,6 +227,8 @@ export const BillingPublicSchemas = {
   listPlans: { action: "read", input: Type.Object({ locale: Type.Optional(Type.String({ maxLength: 512 })) }), optionalInput: true, output: BillingPlansSchema },
 } as const satisfies Record<string, ResourceOperationSchema>;
 export const BillingOperationSchemas = {
+  ...ManagementBillingOperationSchemas,
+  ...ActionBillingOperationSchemas,
   quoteCustomPlan: { action: "read", input: CustomServerResourcesSchema, output: BillingCustomQuoteSchema },
   listCheckouts: { action: "read", input: BillingScopeSchema, optionalInput: true, output: BillingPendingCheckoutsSchema },
   resumeCheckout: { action: "write", input: BillingCheckoutActionInputSchema, output: BillingCheckoutActionResultSchema },

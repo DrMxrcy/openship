@@ -3,8 +3,11 @@
  * projects retain their organization namespace. All customer workspace
  * operations use short-lived namespace tokens, including operations on the SaaS.
  */
+import { diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { createHash } from "node:crypto";
 import { Oblien } from "@repo/adapters";
+import { OblienError } from "oblien";
+import { OperationError } from "@repo/contracts";
 import { AppError, safeErrorMessage } from "@repo/core";
 import { repos } from "@repo/db";
 import { env, runtimeTarget } from "../config/env";
@@ -12,7 +15,8 @@ import { cacheStore } from "./cache-store/index";
 import { getOblienClient } from "./oblien-client";
 import { createProvisionLock } from "./provision-lock";
 import { initialCloudNamespaceLimits } from "./cloud-resource-limits";
-import { assertNamespaceHasQuota, ensureOblienDefaultQuota } from "../modules/billing/billing-oblien-quota";
+import { assertNamespaceHasQuota } from "../modules/billing/billing-oblien-quota";
+import { ensureCloudNamespace } from "./oblien-namespace";
 import { OBLIEN_WEBHOOK_EVENTS, oblienWebhookUrl } from "./oblien-webhook-config";
 import { cloudBillingOwner, ensureDefaultCloudWorkspace, type CloudWorkspaceScope } from "./cloud-workspace-scope";
 
@@ -52,13 +56,11 @@ export async function ensureNamespace(organizationId: string, workspaceId?: Clou
     if (!existing.workspace || existing.workspace.deletionInProgress)
       throw new AppError("Managed server is unavailable", 409, "CLOUD_WORKSPACE_DELETING");
     if (existing.namespace) return existing.namespace;
-    await ensureOblienDefaultQuota();
     const slug = `os-w-${createHash("sha256").update(selected).digest("hex").slice(0, 40)}`;
-    const ensured = await getOblienClient().namespaces.ensure({
+    await ensureCloudNamespace({
       name: `Openship ${existing.workspace.name}`, slug,
       resource_limits: await initialCloudNamespaceLimits(),
     });
-    if (ensured.data.slug !== slug) throw new AppError("Cloud returned an unexpected namespace", 502, "CLOUD_NAMESPACE_MISMATCH");
     await repos.cloudWorkspace.setNamespace(selected, organizationId, slug);
     return slug;
   });
@@ -109,12 +111,91 @@ export async function issueNamespaceToken(organizationId: string, workspaceId?: 
     const result = await getOblienClient().tokens.create({ scope: "namespace", namespace, ttl: 1800 });
     return { token: result.token, namespace, expiresAt: result.expiresAt, providerApiUrl: env.OBLIEN_API_URL };
   } catch (error) {
-    console.warn(`[oblien] token issuance failed for org ${organizationId}: ${safeErrorMessage(error)}`);
+    errorDiagnostics.warn("platform/engine/lib/openship-cloud", `[oblien] token issuance failed for org ${organizationId}: ${safeErrorMessage(error)}`, error);
+    if (error instanceof OblienError && typeof error.status === "number" && [429, 502, 503, 504].includes(error.status)) {
+      const retry = (error.details as { retryAfterSeconds?: unknown } | undefined)?.retryAfterSeconds;
+      throw new OperationError(error.message, error.status, error.code,
+        typeof retry === "number" && Number.isInteger(retry) && retry >= 0 && retry <= 86400 ? { retryAfterSeconds: retry } : undefined);
+    }
     throw new AppError("Cloud access is temporarily unavailable. Please retry.", 503, "CLOUD_TOKEN_UNAVAILABLE");
   }
 }
 
-export async function getNamespaceClient(organizationId: string, workspaceId?: CloudWorkspaceScope): Promise<NamespaceClientResult> {
-  const { token, namespace, providerApiUrl } = await issueNamespaceToken(organizationId, workspaceId);
-  return { client: new Oblien({ token, baseUrl: providerApiUrl }), namespace };
+function namespaceTokenKey(organizationId: string, namespace: string, providerApiUrl: string) {
+  return createHash("sha256").update(JSON.stringify([
+    organizationId, namespace, providerApiUrl, env.OBLIEN_CLIENT_ID, env.OBLIEN_CLIENT_SECRET,
+  ])).digest("hex");
+}
+
+async function internalNamespaceToken(organizationId: string, workspaceId?: CloudWorkspaceScope) {
+  // Authorization is always read before cache lookup. A token cache must never
+  // turn a deleted/moved workspace into access granted by an earlier request.
+  const namespace = await ensureNamespaceWithQuota(organizationId, workspaceId);
+  const key = namespaceTokenKey(organizationId, namespace, env.OBLIEN_API_URL);
+  const store = await cacheStore<NamespaceTokenResult>("oblien-internal-tokens", { maxSize: 10_000 });
+  const readFresh = async () => {
+    const cached = await store.get(key);
+    return cached && Date.parse(cached.expiresAt) - Date.now() > 60_000 ? cached : undefined;
+  };
+  const cached = await readFresh();
+  if (cached) return cached;
+  return createProvisionLock(`cloud:namespace-token:${key}`).run(async () => {
+    const renewed = await readFresh();
+    if (renewed) return renewed;
+    const credentials = await issueNamespaceToken(organizationId, workspaceId);
+    if (credentials.namespace !== namespace || credentials.providerApiUrl !== env.OBLIEN_API_URL)
+      throw new AppError("Cloud execution ownership changed", 409, "CLOUD_NAMESPACE_MISMATCH");
+    const ttl = Math.floor((Date.parse(credentials.expiresAt) - Date.now() - 60_000) / 1000);
+    if (!credentials.token || !Number.isFinite(ttl) || ttl <= 0)
+      throw new AppError("Cloud returned invalid execution credentials", 502, "CLOUD_TOKEN_INVALID");
+    await store.set(key, credentials, Math.min(ttl, 1740));
+    return credentials;
+  });
+}
+
+async function invalidateInternalToken(organizationId: string, credentials: NamespaceTokenResult) {
+  const key = namespaceTokenKey(organizationId, credentials.namespace, credentials.providerApiUrl);
+  const store = await cacheStore<NamespaceTokenResult>("oblien-internal-tokens", { maxSize: 10_000 });
+  await createProvisionLock(`cloud:namespace-token:${key}`).run(async () => {
+    // A late rejection of the old token must not evict a newer renewal.
+    if ((await store.get(key))?.token === credentials.token) await store.delete(key);
+  });
+}
+
+export async function getNamespaceClient(
+  organizationId: string,
+  workspaceId?: CloudWorkspaceScope,
+  initialCredentials?: NamespaceTokenResult,
+): Promise<NamespaceClientResult> {
+  // Public token issuance stays independent: revoking a desktop's token cannot
+  // revoke the SaaS's shared execution credentials. Linked instances continue
+  // to obtain their authority from their remote connection on each lookup.
+  const reuse = env.CLOUD_MODE && !initialCredentials;
+  const obtain = () => reuse
+    ? internalNamespaceToken(organizationId, workspaceId)
+    : issueNamespaceToken(organizationId, workspaceId);
+  let credentials = initialCredentials ?? await obtain();
+  const { namespace, providerApiUrl } = credentials;
+  return {
+    client: new Oblien({
+      token: credentials.token,
+      baseUrl: credentials.providerApiUrl,
+      tokenRefresh: {
+        expiresAt: credentials.expiresAt,
+        refresh: async () => {
+          const next = await obtain();
+          if (next.namespace !== namespace || next.providerApiUrl !== providerApiUrl)
+            throw new AppError(
+              "Cloud execution ownership changed",
+              409,
+              "CLOUD_NAMESPACE_MISMATCH",
+            );
+          credentials = next;
+          return next;
+        },
+        invalidate: reuse ? (rejectedToken) => invalidateInternalToken(organizationId, { ...credentials, token: rejectedToken }) : undefined,
+      },
+    }),
+    namespace,
+  };
 }

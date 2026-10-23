@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { repos } from "@repo/db";
 import { AppError } from "@repo/core";
 import type { RuntimeAdapter } from "@repo/adapters";
@@ -5,7 +6,7 @@ import {
   resolveDeploymentPlatform,
   resolveDeploymentRuntimeForRead,
 } from "../../lib/deployment-runtime";
-import { resolveLiveServiceState } from "./live-state";
+import { resolveLiveServiceState, type LiveMatchKind } from "./live-state";
 import { isRealContainerRef } from "../../lib/container-ref";
 import { pickPrimaryServiceId } from "../../lib/public-endpoints";
 import type { DeploymentConfigSnapshot } from "../deployments/build.service";
@@ -72,7 +73,7 @@ export async function resolveServiceRuntimeForRead(
     projectId: project.id,
   })
     .then((r) => r.runtime)
-    .catch(() => null);
+    .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/services/service-container"); return null; });
 }
 
 /** The runtime surface live identity resolution needs — anything that can list
@@ -103,8 +104,13 @@ export interface HostContainerLister {
  */
 export async function liveContainerIdWithRuntime(
   runtime: HostContainerLister | null | undefined,
-  args: { service: { id: string; name: string }; projectId: string; slug: string; tracked: string | null },
-  opts?: { requireLiveQuery?: boolean },
+  args: {
+    service: { id: string; name: string };
+    projectId: string;
+    slug: string;
+    tracked: string | null;
+  },
+  opts?: { requireLiveQuery?: boolean; tiers?: readonly LiveMatchKind[] },
 ): Promise<string | null> {
   return (await liveContainerStateWithRuntime(runtime, args, opts)).containerId;
 }
@@ -128,8 +134,13 @@ export async function liveContainerIdWithRuntime(
  */
 export async function liveContainerStateWithRuntime(
   runtime: HostContainerLister | null | undefined,
-  args: { service: { id: string; name: string }; projectId: string; slug: string; tracked: string | null },
-  opts?: { requireLiveQuery?: boolean },
+  args: {
+    service: { id: string; name: string };
+    projectId: string;
+    slug: string;
+    tracked: string | null;
+  },
+  opts?: { requireLiveQuery?: boolean; tiers?: readonly LiveMatchKind[] },
 ): Promise<{ containerId: string | null; running: boolean | null }> {
   if (!runtime?.supports("hostContainerQuery") || !runtime.listAllContainers) {
     return { containerId: args.tracked, running: null };
@@ -147,6 +158,7 @@ export async function liveContainerStateWithRuntime(
     projectId: args.projectId,
     slug: args.slug,
     trackedIds: { [args.service.id]: args.tracked },
+    tiers: opts?.tiers,
   }).get(args.service.id);
   if (!match?.containerId) return { containerId: null, running: null };
   return { containerId: match.containerId, running: match.status !== "stopped" };
@@ -178,8 +190,8 @@ export async function livePrimaryContainerId(
 ): Promise<string | null> {
   const recorded = isRealContainerRef(dep.containerId) ? dep.containerId : null;
   const [project, rows] = await Promise.all([
-    repos.project.findById(dep.projectId).catch(() => null),
-    repos.service.listByDeployment(dep.id).catch(() => []),
+    repos.project.findById(dep.projectId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/services/service-container"); return null; }),
+    repos.service.listByDeployment(dep.id).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/services/service-container"); return []; }),
   ]);
   // THIS release's own rows decide whether it was a service deploy. The project's
   // current service list would misread a single-app release that later gained a
@@ -187,8 +199,8 @@ export async function livePrimaryContainerId(
   if (!project || rows.length === 0) return recorded;
 
   const [services, domainRows] = await Promise.all([
-    repos.service.listByProject(dep.projectId).catch(() => []),
-    repos.domain.listByProject(dep.projectId).catch(() => []),
+    repos.service.listByProject(dep.projectId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/services/service-container"); return []; }),
+    repos.domain.listByProject(dep.projectId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/services/service-container"); return []; }),
   ]);
   const candidates = services.filter(
     (svc) => svc.enabled && rows.some((r) => r.serviceId === svc.id && r.containerId),
@@ -207,7 +219,9 @@ export async function livePrimaryContainerId(
     tracked: row.containerId,
   });
   if (live && live !== row.containerId) {
-    await repos.service.updateServiceDeployment(row.id, { containerId: live }).catch(() => {});
+    await repos.service.updateServiceDeployment(row.id, { containerId: live }).catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "platform/engine/modules/services/service-container");
+    });
   }
   return live;
 }
@@ -263,6 +277,8 @@ export async function liveContainerForService(
       tracked,
     });
   } finally {
-    void Promise.resolve(runtime.dispose?.()).catch(() => {});
+    void Promise.resolve(runtime.dispose?.()).catch((diagnosticFailure) => {
+      observeCaughtError(diagnosticFailure, "platform/engine/modules/services/service-container");
+    });
   }
 }

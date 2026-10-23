@@ -1,5 +1,6 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 import React, { useCallback, useEffect, useId, useMemo, useState } from "react";
@@ -60,8 +61,7 @@ export interface RoutingSettingsCardProps {
   /**
    * Canonical redirect: serve a 30x to another of the project's hostnames instead
    * of the app. Omit the whole prop to hide the control — the parent decides
-   * whether it applies (there's nothing to redirect to with one hostname, and
-   * Openship Cloud owns routing for cloud projects, so it's refused there).
+   * whether it applies (there is nothing to redirect to with one hostname).
    *
    * `targets` are the project's OTHER hostnames; picking "" means serve normally.
    */
@@ -150,7 +150,8 @@ export function RoutingSettingsCard({
       const res = await domainsApi.previewRecords(hostname);
       setDnsRecords(res.data.records);
       setDnsMode(res.data.mode);
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "dashboard/components/routing/RoutingSettingsCard");
       setDnsRecords([]);
     } finally {
       setLoadingRecords(false);

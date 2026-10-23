@@ -14,18 +14,21 @@
  *     completion before releasing that server.
  */
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { randomBytes } from "node:crypto";
 import { env } from "@repo/platform/engine/config/env";
 import type { RuntimeAdapter, ShellSession } from "@repo/adapters";
 import { disposeRuntime } from "@repo/platform/engine/lib/deployment-runtime";
 import type { TerminalExitReason } from "@repo/db";
-import type { ExecutionContext as RequestContext } from "@repo/platform";
+import { freezeContext, type ExecutionContext as RequestContext } from "@repo/platform";
 import { safeErrorMessage } from "@repo/core";
 import type { CloudTerminalTicket } from "./cloud/terminal-bridge";
+import { trackBackgroundWork } from "@repo/platform/engine/lib/background-work";
 
 // ─── Tickets ────────────────────────────────────────────────────────────────
 
 interface Ticket {
+  context: RequestContext;
   token: string;
   userId: string;
   /** Org the user was acting in at mint time — locks the consume-time
@@ -52,6 +55,7 @@ export function issueServiceTerminalTicket(
   const ttl = env.TERMINAL_TICKET_TTL_MS;
   const token = newToken();
   tickets.set(token, {
+    context: freezeContext(ctx),
     token,
     userId: ctx.userId,
     organizationId: ctx.organizationId,
@@ -65,7 +69,7 @@ export function issueServiceTerminalTicket(
 
 export function consumeServiceTerminalTicket(
   token: string,
-): { userId: string; organizationId: string; serviceId: string; cloud?: CloudTerminalTicket } | null {
+): { context: RequestContext; userId: string; organizationId: string; serviceId: string; cloud?: CloudTerminalTicket } | null {
   if (!token) return null;
   const ticket = tickets.get(token);
   if (!ticket) return null;
@@ -73,6 +77,7 @@ export function consumeServiceTerminalTicket(
   if (ticket.used) return null;
   if (ticket.expiresAt <= Date.now()) return null;
   return {
+    context: ticket.context,
     userId: ticket.userId,
     organizationId: ticket.organizationId,
     serviceId: ticket.serviceId,
@@ -218,7 +223,8 @@ export function attachServiceWs(
   for (const chunk of session.scrollback) {
     try {
       onData(chunk);
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "api/lib/service-terminal-session-manager");
       /* WS gone mid-replay */
     }
   }
@@ -245,7 +251,8 @@ export function dispatchServiceStdout(sessionId: string, chunk: Buffer): void {
   if (!handler) return;
   try {
     handler(chunk);
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "api/lib/service-terminal-session-manager");
     /* peer gone */
   }
 }
@@ -258,7 +265,8 @@ function fireTimeout(
   unregisterServiceSession(session.sessionId);
   try {
     session.onTimeout(session.sessionId, reason);
-  } catch {
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "api/lib/service-terminal-session-manager");
     /* timeout hook is best-effort */
   }
 }
@@ -286,9 +294,11 @@ export function unregisterServiceSession(sessionId: string): boolean {
   // The one place every ending path converges (user close, remote exit, idle and
   // hard-cap timeouts all land here), so the shell's transport is released once.
   if (session.release) {
-    void session.release().catch(error => {
-      console.warn("[service-terminal] recovery pending:", safeErrorMessage(error));
-    });
+    void trackBackgroundWork(
+      Promise.resolve().then(() => session.release?.()).catch(error => {
+        errorDiagnostics.warn("api/lib/service-terminal-session-manager", "[service-terminal] recovery pending:", safeErrorMessage(error), error);
+      }),
+    );
   } else disposeRuntime(session.runtime);
   session.runtime = null;
   session.scrollback = [];
@@ -307,4 +317,10 @@ export function getServiceSession(
   sessionId: string,
 ): ActiveServiceSession | undefined {
   return sessions.get(sessionId);
+}
+
+/** End parked as well as attached container shells before exporting a controller. */
+export function closeControllerServiceTerminals(): void {
+  tickets.clear();
+  for (const session of [...sessions.values()]) fireTimeout(session, "server_error");
 }

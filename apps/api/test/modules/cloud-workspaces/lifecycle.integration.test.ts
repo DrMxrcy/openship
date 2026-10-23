@@ -1,3 +1,4 @@
+import { savedMonthlyHobby } from "../../helpers/saved-cloud-offer";
 import capacityCatalog from "../../fixtures/oblien-capacity-catalog.json";
 import { monthlyCloudBilling } from "../../helpers/monthly-cloud-offer";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
@@ -57,6 +58,7 @@ import { AppError } from "@repo/core";
 import { OperationError } from "@repo/contracts";
 import { serverResourceRoutes } from "../../../src/modules/system/server-resource.routes";
 import { billingSaasRoutes } from "../../../src/modules/billing/billing.routes";
+import { appRoutes } from "../../../src/modules/apps/app.routes";
 import { healthRoutes } from "../../../src/modules/health/health.routes";
 import { mcpRoutes } from "../../../src/modules/mcp/mcp.routes";
 import { resetMcpToolCache } from "../../../src/modules/mcp/mcp-tools";
@@ -108,6 +110,7 @@ const app = new Hono()
   .route("/api/health", healthRoutes)
   .route("/api/system", serverResourceRoutes)
   .route("/api/billing", billingSaasRoutes)
+  .route("/api/apps", appRoutes)
   .route("/api/mcp", mcpRoutes);
 const vms = new Map<string, any>();
 const subscriptions = new Map<string, OblienSubscription>();
@@ -156,7 +159,7 @@ function subscribe(tier: "hobby" | "starter" = "hobby") {
     periodEnd: "2026-11-01T00:00:00Z",
     cancelAtPeriodEnd: false,
     canceledAt: null,
-    offer: subscriptionOffer(tier, "monthly"),
+    offer: tier === "hobby" ? savedMonthlyHobby() : subscriptionOffer(tier, "monthly"),
     metadata: subscriptionMetadata(tier, owner.orgId, namespace),
   });
 }
@@ -326,6 +329,80 @@ afterEach(async () => {
 });
 
 describe("subscription-owned Cloud workspace lifecycle", () => {
+  it("presents historical Cloud space progress without rewriting provider diagnostics or stored logs", async () => {
+    await provision();
+    const row = (await repos.cloudWorkspace.findById(workspace.id))!;
+    const providerDiagnostic = "Oblien server diagnostic: Server is ready for projects. (HTTP 503)";
+    const logs = [
+      "Waiting for the server to finish its current operation…",
+      "Checking the server and its current subscription…",
+      "Preparing the subscribed Docker host…",
+      "Resizing the server; running projects will briefly restart…",
+      "Confirming provider cleanup before removing this empty server…",
+      "Server capacity applied; previously running services restored.",
+      "Server is ready for projects.",
+      "Your Cloud space is ready for projects.",
+      providerDiagnostic,
+    ];
+    await repos.cloudWorkspace.updateOperation(
+      workspace.id,
+      { ...row.operation!, logs },
+      row.operation!.id,
+    );
+
+    const result = await request("GET", `/${workspace.id}`);
+    expect(result.status).toBe(200);
+    expect(result.body.managed.operation).toMatchObject({
+      id: row.operation!.id,
+      status: "succeeded",
+      logs: [
+        "Waiting for the Cloud space to finish its current operation…",
+        "Checking the Cloud space and its current subscription…",
+        "Preparing your Cloud space…",
+        "Applying Cloud space capacity; running projects will briefly restart…",
+        "Confirming cleanup before removing this unused Cloud space…",
+        "Cloud space capacity applied; previously running services restored.",
+        "Your Cloud space is ready for projects.",
+        "Your Cloud space is ready for projects.",
+        providerDiagnostic,
+      ],
+    });
+    expect((await repos.cloudWorkspace.findById(workspace.id))?.operation?.logs).toEqual(logs);
+  });
+
+  it("keeps a first app's server identity through the plan refusal, payment and draft retry", async () => {
+    owner = await seedOwner();
+    const install = async () => {
+      const response = await app.request("/api/apps", {
+        method: "POST",
+        headers: { ...owner.auth, "content-type": "application/json" },
+        body: JSON.stringify({ templateId: "minio", name: "My storage", routes: [] }),
+      });
+      return { status: response.status, body: await response.json() as any };
+    };
+    const refused = await install();
+    expect(refused.status).toBe(402);
+    expect(refused.body).toMatchObject({ code: "PLAN_UPGRADE_REQUIRED", reason: "static-only", workspaceId: expect.any(String) });
+    const rows = await db.select().from(schema.cloudWorkspace).where(eq(schema.cloudWorkspace.organizationId, owner.orgId));
+    expect(rows).toHaveLength(1);
+    workspace = rows[0];
+    expect(refused.body.workspaceId).toBe(workspace.id);
+    expect(await db.select().from(schema.project).where(eq(schema.project.organizationId, owner.orgId))).toHaveLength(0);
+
+    // Simulate the provider's paid subscription; the real engine rechecks it.
+    await ensureNamespace(owner.orgId, workspace.id);
+    workspace = (await repos.cloudWorkspace.findById(workspace.id))!;
+    subscribe();
+    const installed = await install();
+    expect(installed.status, JSON.stringify(installed.body)).toBe(200);
+    const repeated = await install();
+    expect(repeated.body.data.projectId).toBe(installed.body.data.projectId);
+    const projects = await db.select().from(schema.project).where(eq(schema.project.organizationId, owner.orgId));
+    expect(projects).toHaveLength(1);
+    expect(projects[0].serverId).toBe((await repos.server.findByWorkspace(workspace.id, owner.orgId))!.id);
+    expect(await db.select().from(schema.cloudWorkspace).where(eq(schema.cloudWorkspace.organizationId, owner.orgId))).toHaveLength(1);
+  });
+
   it("reconciles each server once without an ambiguous organization billing pass", async () => {
     const sibling = await repos.cloudWorkspace.create({ organizationId: owner.orgId, name: "Second server" });
     await ensureNamespace(owner.orgId, sibling.id);
@@ -657,6 +734,33 @@ describe("subscription-owned Cloud workspace lifecycle", () => {
     }
     expect(h.client.workspaces.create).not.toHaveBeenCalled();
   });
+
+  it("recovers one draft and its server across concurrent native/HTTP creates and scopes retries by organization", async () => {
+    const [native, remote] = await clients();
+    const input = { name: "Pricing purchase", idempotencyKey: randomUUID() };
+    const created = await Promise.all([native!.createManaged(input), remote!.createManaged(input), native!.createManaged(input)]);
+    expect(new Set(created.map(row => row.id)).size).toBe(1);
+    expect(new Set(created.map(row => row.serverId)).size).toBe(1);
+    expect((await repos.cloudWorkspace.listByOrganization(owner.orgId)).filter(row => row.name === input.name)).toHaveLength(1);
+    await remote!.update(created[0]!.serverId, { name: "Keep my renamed server" });
+    expect(await native!.createManaged(input)).toMatchObject({ id: created[0]!.id, name: "Keep my renamed server" });
+    const stranger = await seedOwner();
+    const other = await (await clients(stranger))[0]!.createManaged(input);
+    expect(other.id).not.toBe(created[0]!.id);
+    expect(h.client.workspaces.create).not.toHaveBeenCalled();
+  });
+
+  it("never recreates a deleted purchase identity or its old provider namespace", async () => {
+    const [native, remote] = await clients();
+    const input = { name: "Removed pricing purchase", idempotencyKey: randomUUID() };
+    const created = await native!.createManaged(input);
+    await remote!.removeManaged(created.serverId, { idempotencyKey: randomUUID(), confirmDelete: true });
+    await drainBackgroundWork();
+    await expect(native!.createManaged(input)).rejects.toMatchObject({ code: "CLOUD_WORKSPACE_PURCHASE_REMOVED" });
+    await expect(remote!.createManaged(input)).rejects.toMatchObject({ code: "CLOUD_WORKSPACE_PURCHASE_REMOVED" });
+    expect(await repos.cloudWorkspace.findById(created.id)).toBeUndefined();
+    expect(h.client.workspaces.create).not.toHaveBeenCalled();
+  });
   it("does not provision, stop or change the entitlement mirror when provider billing is unavailable", async () => {
     await syncOblienEntitlement(owner.orgId, { workspaceId: workspace.id });
     h.billing.getEntitlement.mockRejectedValue(new Error("Billing temporarily unavailable"));
@@ -791,7 +895,7 @@ describe("workspace payment and deletion races", () => {
       namespace: workspace.namespace!,
       kind: "subscription" as const,
       billingInterval: "monthly" as const,
-      offer: subscriptionOffer("hobby", "monthly"),
+      offer: savedMonthlyHobby(),
       metadata: subscriptionMetadata("hobby", owner.orgId, workspace.namespace!),
       successUrl: "https://app.openship.io/billing",
       cancelUrl: "https://app.openship.io/billing",
@@ -817,7 +921,22 @@ describe("workspace payment and deletion races", () => {
     const selected = async () => (await remote().listCheckouts({ workspaceId: workspace.id })).items[0]!;
     const action = async () => ({ workspaceId: workspace.id, id: (await selected()).id });
     beforeEach(() => {
-      payments.clear(); accepted.clear(); reservations.clear();
+      payments.clear();
+      accepted.clear();
+      reservations.clear();
+      h.billing.getCatalog = vi.fn(async () => ({ reseller: { checkoutCancellation: false } }));
+      h.billing.cancelCheckout = vi.fn(
+        async (namespace: string, id: string, input: { idempotencyKey: string }) => {
+          const saved = (await repos.cloudWorkspace.findByNamespace(namespace))!;
+          expect(
+            saved.pendingCheckouts.find((item) => item.checkoutId === id)?.cancellation,
+          ).toEqual({ checkoutId: id, ...input });
+          expect(payments.get(id)!.namespace).toBe(namespace);
+          payments.get(id)!.status = "expired";
+          reservations.delete(namespace);
+          return { checkout: { ...payments.get(id) } };
+        },
+      );
       subscriptions.delete(workspace.namespace!);
       h.billing.createCheckout = vi.fn(async (input: ReturnType<typeof checkout>) => {
         let id = accepted.get(input.idempotencyKey);
@@ -847,6 +966,78 @@ describe("workspace payment and deletion races", () => {
         reservations.delete(namespace);
         return { success: true, namespace, pendingCheckout: null };
       });
+    });
+    it("cancels a legacy retail payment without a capacity quote when the provider supports checkout cancellation", async () => {
+      await purchase();
+      h.billing.getCatalog.mockResolvedValue({ reseller: { checkoutCancellation: true } });
+      h.billing.getPendingCapacityCheckout.mockRejectedValue(
+        new Error("must not depend on a capacity quote"),
+      );
+      const item = await selected();
+      expect(item).toMatchObject({ canCancel: true, state: "open" });
+      expect(item).not.toHaveProperty("cancelUnavailableReason");
+      expect(
+        await remote().cancelCheckout({ workspaceId: workspace.id, id: item.id }),
+      ).toMatchObject({ status: "expired" });
+      expect((await repos.cloudWorkspace.findById(workspace.id))!.pendingCheckouts).toEqual([]);
+      expect(h.billing.getPendingCapacityCheckout).not.toHaveBeenCalled();
+      expect(h.billing.cancelCapacityCheckout).not.toHaveBeenCalled();
+      await expect(purchase()).resolves.toHaveProperty("checkoutId");
+    });
+    it("retries an uncertain generic cancellation from its saved checkout identity even after capability discovery fails", async () => {
+      await purchase();
+      h.billing.getCatalog.mockResolvedValue({ reseller: { checkoutCancellation: true } });
+      const input = await action();
+      h.billing.cancelCheckout.mockRejectedValueOnce(new Error("timeout"));
+      await expect(remote().cancelCheckout(input)).rejects.toThrow();
+      const saved = (await repos.cloudWorkspace.findById(workspace.id))!.pendingCheckouts[0]!
+        .cancellation!;
+      expect(saved).toHaveProperty("checkoutId");
+      h.billing.getCatalog.mockRejectedValue(new Error("catalog offline"));
+      expect(await selected()).toMatchObject({
+        state: "canceling",
+        canResume: false,
+        canCancel: true,
+      });
+      await expect(remote().resumeCheckout(input)).rejects.toMatchObject({
+        code: "CLOUD_WORKSPACE_CHECKOUT_PENDING",
+      });
+      await expect(purchase()).rejects.toMatchObject({ code: "CLOUD_WORKSPACE_CHECKOUT_PENDING" });
+      expect(await remote().cancelCheckout(input)).toMatchObject({ status: "expired" });
+      expect(h.billing.cancelCheckout.mock.calls[0]).toEqual(
+        h.billing.cancelCheckout.mock.calls[1],
+      );
+    });
+    it("resolves lost generic cancellation responses from the original checkout, including payment races", async () => {
+      await purchase();
+      h.billing.getCatalog.mockResolvedValue({ reseller: { checkoutCancellation: true } });
+      const cancel = h.billing.cancelCheckout.getMockImplementation()!;
+      h.billing.cancelCheckout.mockImplementationOnce(async (...args: any[]) => {
+        await cancel(...args);
+        throw new Error("lost response");
+      });
+      expect(await remote().cancelCheckout(await action())).toMatchObject({ status: "expired" });
+      const next = await purchase();
+      h.billing.cancelCheckout.mockImplementationOnce(async () => {
+        Object.assign(payments.get(next.checkoutId)!, {
+          status: "complete",
+          paymentStatus: "paid",
+        });
+        throw new Error("checkout already paid");
+      });
+      expect(await remote().cancelCheckout(await action())).toMatchObject({ status: "processing" });
+      expect((await repos.cloudWorkspace.findById(workspace.id))!.pendingCheckouts).toHaveLength(1);
+      await expect(purchase()).rejects.toMatchObject({ code: "CLOUD_WORKSPACE_CHECKOUT_PENDING" });
+    });
+    it("reports failed capability discovery as unavailable rather than unsupported", async () => {
+      await purchase();
+      h.billing.getCatalog.mockRejectedValue(new Error("catalog offline"));
+      h.billing.getPendingCapacityCheckout.mockResolvedValue({ pendingCheckout: null });
+      expect(await selected()).toMatchObject({
+        canCancel: false,
+        cancelUnavailableReason: "provider_unavailable",
+      });
+      expect(h.billing.cancelCheckout).not.toHaveBeenCalled();
     });
     it("lists lost responses without replaying a payment, then recovers the exact saved offer and identity", async () => {
       const original = checkout();
@@ -940,15 +1131,51 @@ describe("workspace payment and deletion races", () => {
       expect((await request("DELETE", `/${workspace.id}`, { confirmDelete: true, idempotencyKey: randomUUID() })).body.code)
         .toBe("CLOUD_WORKSPACE_CHECKOUT_PENDING");
     });
-    it.each(["other-checkout", null])("never cancels an unrelated or missing capacity payment (%s)", async checkoutId => {
+    it.each(["other-checkout", null])(
+      "never cancels an unrelated or missing capacity payment (%s)",
+      async (checkoutId) => {
+        await purchase();
+        h.billing.getPendingCapacityCheckout.mockResolvedValue({
+          pendingCheckout: checkoutId
+            ? {
+                checkoutId,
+                quote: { id: "other-quote", paymentSource: "stripe" },
+              }
+            : null,
+        });
+        expect(await selected()).toMatchObject({
+          canResume: true,
+          canCancel: false,
+          cancelUnavailableReason: "unsupported",
+        });
+        await expect(remote().cancelCheckout(await action())).rejects.toMatchObject({
+          code: "BILLING_CHECKOUT_CANCEL_UNAVAILABLE",
+        });
+        expect(h.billing.cancelCapacityCheckout).not.toHaveBeenCalled();
+        expect(
+          (await repos.cloudWorkspace.findById(workspace.id))!.pendingCheckouts[0],
+        ).not.toHaveProperty("cancellation");
+      },
+    );
+    it("distinguishes a failed cancellation read from unsupported cancellation, then restores Cancel after refresh", async () => {
       await purchase();
-      h.billing.getPendingCapacityCheckout.mockResolvedValue({ pendingCheckout: checkoutId ? {
-        checkoutId, quote: { id: "other-quote", paymentSource: "stripe" },
-      } : null });
-      expect(await selected()).toMatchObject({ canResume: true, canCancel: false });
-      await expect(remote().cancelCheckout(await action())).rejects.toMatchObject({ code: "BILLING_CHECKOUT_CANCEL_UNAVAILABLE" });
+      h.billing.getPendingCapacityCheckout.mockRejectedValueOnce(new Error("provider timeout"));
+      const item = await selected();
+      expect(item).toMatchObject({
+        state: "open",
+        canResume: true,
+        canCancel: false,
+        cancelUnavailableReason: "provider_unavailable",
+      });
       expect(h.billing.cancelCapacityCheckout).not.toHaveBeenCalled();
-      expect((await repos.cloudWorkspace.findById(workspace.id))!.pendingCheckouts[0]).not.toHaveProperty("cancellation");
+      expect(h.billing.createCheckout).toHaveBeenCalledOnce();
+      const refreshed = await selected();
+      expect(refreshed).toMatchObject({ state: "open", canCancel: true });
+      expect(refreshed).not.toHaveProperty("cancelUnavailableReason");
+      expect(
+        await remote().cancelCheckout({ workspaceId: workspace.id, id: item.id }),
+      ).toMatchObject({ status: "expired" });
+      await expect(purchase()).resolves.toHaveProperty("checkoutId");
     });
     it("keeps unknown provider state pending and does not replay, clear or cancel it", async () => {
       await purchase();
@@ -1310,7 +1537,7 @@ describe("provider subscription changes through billing and the shared server wo
     subscribe("starter"); await provision();
     const client = await billingClient();
     await expect(client.previewSubscriptionChange({ workspaceId: workspace.id, planTierId: "hobby", idempotencyKey: randomUUID() }))
-      .rejects.toMatchObject({ code: "CLOUD_WORKSPACE_DISK_SHRINK" });
+      .rejects.toMatchObject({ code: "BILLING_PLAN_RETIRED" });
     expect(h.billing.previewPlanChange).not.toHaveBeenCalled();
     const custom = customSubscriptionOffer({ cpuCores: 1, memoryMb: 4096, diskGb: 128 }).quote;
     const quote = await client.previewSubscriptionChange({ workspaceId: workspace.id, planTierId: custom.basePlanTierId,

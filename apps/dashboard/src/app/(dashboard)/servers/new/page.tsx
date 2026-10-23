@@ -1,9 +1,10 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 import { useEffect, useState, type ReactNode } from "react";
-import { redirect, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { useCloud } from "@/context/CloudContext";
 import { usePlatform } from "@/context/PlatformContext";
 import { ServerAcquisitionPicker } from "@/components/servers/ServerAcquisition";
@@ -90,11 +91,11 @@ export default function AddServerPage() {
   const { selfHosted } = usePlatform();
   const router = useRouter();
   const { requireCloud } = useCloud();
-  if (!selfHosted) redirect(newServerBillingHref());
+
   return (
     <ConnectedServerSetup choice={
       <ServerAcquisitionPicker value="connected" stacked onChange={async (mode) => {
-        if (mode === "managed" && await requireCloud("billing")) router.push(newServerBillingHref());
+        if (mode === "managed" && (!selfHosted || await requireCloud("billing"))) router.push(newServerBillingHref());
       }} />
     } />
   );
@@ -133,7 +134,8 @@ function ConnectedServerSetup({ choice }: { choice?: ReactNode }) {
           const result = await systemApi.checkServer(currentServerId);
           setComponents((current) => buildComponentStates(result.components, current));
           setOverallReady(result.ready);
-        } catch {
+        } catch (diagnosticFailure) {
+          observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/servers/new/page");
           // Keep whatever we have from the stream
         }
         if (event.status === "completed") {
@@ -167,16 +169,17 @@ function ConnectedServerSetup({ choice }: { choice?: ReactNode }) {
 
         let session: Awaited<ReturnType<typeof systemApi.getInstallSession>> | null = null;
         try {
-          session = await systemApi.getInstallSession();
-        } catch {
+          session = await systemApi.getInstallSession(undefined, editId ?? undefined);
+        } catch (diagnosticFailure) {
+          observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/servers/new/page");
           /* no active session */
         }
 
         let existing: ServerInfo | null = null;
         if (editId) {
-          existing = await systemApi.getServerById(editId).catch(() => null);
+          existing = await systemApi.getServerById(editId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/servers/new/page"); return null; });
         } else if (session?.active && session.status === "running" && session.serverId) {
-          existing = await systemApi.getServerById(session.serverId).catch(() => null);
+          existing = await systemApi.getServerById(session.serverId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/servers/new/page"); return null; });
         }
 
         if (existing) {
@@ -195,7 +198,8 @@ function ConnectedServerSetup({ choice }: { choice?: ReactNode }) {
             void setupStream.attachToSession(session.sessionId);
           }
         }
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/servers/new/page");
         /* fresh form */
       } finally {
         setLoaded(true);

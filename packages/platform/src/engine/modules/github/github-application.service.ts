@@ -1,3 +1,5 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
+import { cloudGitHubConnection, isHostedGitHubAttempt } from "./github-cloud-connection";
 import { instanceAuthorization } from "../../lib/instance-authorization";
 import { assertCloudTenantScope } from "../../lib/cloud/scope";
 /**
@@ -57,7 +59,7 @@ export async function getStatus(
     input?.includeInstallUrl === false
       ? { url: "", cloudUnreachable: false }
       : source.resolveInstallUrl(),
-    hasConfiguredGitHubSource(ctx.organizationId).catch(() => false),
+    hasConfiguredGitHubSource(ctx.organizationId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/github/github-application.service"); return false; }),
   ]);
   const allowedAccounts = await filterAllowedAccounts(ctx, accounts, (a) => a.login);
   // Connect methods, derived server-side from the SAME chain table that resolves
@@ -67,8 +69,8 @@ export async function getStatus(
   const { resolveGitHubCapabilities } = await import("@repo/platform/engine/modules/github/github.capabilities");
   const { isCloudConnected } = await import("@repo/platform/engine/lib/cloud/session");
   const capabilities = await resolveGitHubCapabilities(ctx, {
-    cloudConnected: await isCloudConnected(ctx.userId).catch(() => false),
-  }).catch(() => null);
+    cloudConnected: await isCloudConnected(ctx.userId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/github/github-application.service"); return false; }),
+  }).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/github/github-application.service"); return null; });
   return {
     state,
     accounts: allowedAccounts,
@@ -119,8 +121,8 @@ export async function getHome(ctx: ExecutionContext) {
   const { resolveGitHubCapabilities } = await import("@repo/platform/engine/modules/github/github.capabilities");
   const { isCloudConnected } = await import("@repo/platform/engine/lib/cloud/session");
   const capabilities = await resolveGitHubCapabilities(ctx, {
-    cloudConnected: await isCloudConnected(ctx.userId).catch(() => false),
-  }).catch(() => null);
+    cloudConnected: await isCloudConnected(ctx.userId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/github/github-application.service"); return false; }),
+  }).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/github/github-application.service"); return null; });
 
   return {
     ...data,
@@ -311,38 +313,7 @@ export async function connect(ctx: ExecutionContext, input: NonNullable<Paramete
   //
   // The bridge authorizes repository access on Cloud independently of sign-in.
   // The subsequent App setup callback claims its installation for this workspace.
-  if (mode === "cloud-app") {
-    const status = await githubAuth.getUserStatus(userId, ctx);
-
-    // Authorize the initiating GitHub user before requesting App installation.
-    if (!status.connected) {
-      const oauth = await githubAuth.resolveOauthHandoffUrl(userId);
-      if (oauth) {
-        return {
-          connected: false,
-          flow: "redirect" as const,
-          url: oauth.url,
-          step: "oauth" as const,
-        };
-      }
-      // SaaS-only mode: the OAuth handoff URL comes from openship.io. A
-      // null here means the SaaS is unreachable. We must NOT degrade to a
-      // stateless github.com install link — that skips the OAuth step the
-      // webhook needs and orphans the install. Tell the user the truth.
-      throw responseError(CLOUD_UNREACHABLE_CONNECT, 503);
-    }
-
-    // Step 2: OAuth done. Check if installations already exist.
-    if (status.connected) {
-      const installations = await githubAuth.getUserInstallations(ctx, status);
-      if (installations.length > 0) {
-        return { connected: true };
-      }
-    }
-
-    // Step 2 continued: no installations yet → return install URL.
-    return installationRedirect(ctx);
-  }
+  if (mode === "cloud-app") return cloudGitHubConnection(ctx, "connect", input);
 
   // Clicking Connect always means "I want to be connected" - clear any
   // prior cli-suppression flag from a previous Disconnect so the status
@@ -457,6 +428,7 @@ export async function connect(ctx: ExecutionContext, input: NonNullable<Paramete
         interval: verification.interval,
       };
     } catch (err) {
+      observeCaughtError(err, "platform/engine/modules/github/github-application.service");
       throw responseError({ connected: false, error: (err as Error).message }, 500);
     }
   }
@@ -489,6 +461,8 @@ export async function connect(ctx: ExecutionContext, input: NonNullable<Paramete
 
 /** POST /github/installations/claim — connect a verified App installation to this workspace. */
 export async function claimInstallation(ctx: ExecutionContext, input: NonNullable<Parameters<GitHubOperations["claimInstallation"]>[0]>) {
+  if (!env.CLOUD_MODE && isHostedGitHubAttempt(input.state))
+    return cloudGitHubConnection(ctx, "claimInstallation", input);
   if (env.CLOUD_MODE) {
     const binding = await repos.githubInstallState.find(input.state);
     if (!binding || binding.userId !== ctx.userId || binding.organizationId !== ctx.organizationId || binding.flow !== "install" || binding.sourceId) {
@@ -539,6 +513,8 @@ export async function getLocalStatus(ctx: ExecutionContext) {
  */
 export async function pollConnect(ctx: ExecutionContext, input?: Parameters<GitHubOperations["pollConnect"]>[0]) {
   if (input?.state) {
+    if (!env.CLOUD_MODE && isHostedGitHubAttempt(input.state))
+      return cloudGitHubConnection(ctx, "pollConnect", input);
     const result = await repos.githubInstallState.progress(input.state, ctx.userId, ctx.organizationId);
     if (result.status === "expired") return { status: "error" as const, error: "This GitHub connection attempt expired. Start again." };
     if (result.status === "pending-approval") return { status: "error" as const, error: "A GitHub organization owner must approve this App installation. Connect again after approval." };
@@ -590,6 +566,7 @@ export async function setInstanceToken(ctx: ExecutionContext, input: NonNullable
   try {
     report = await githubService.inspectPatScope(token);
   } catch (err) {
+    observeCaughtError(err, "platform/engine/modules/github/github-application.service");
     throw responseError({
         error: err instanceof Error ? err.message : "Could not validate token",
         code: "INVALID_TOKEN",
@@ -786,7 +763,7 @@ export async function getCloneToken(ctx: ExecutionContext, input: NonNullable<Pa
 
   const { resolveGitHubWebBaseUrl } = await import("@repo/platform/engine/modules/github/github-source.service");
   const webBaseUrl =
-    (await resolveGitHubWebBaseUrl(ctx.organizationId, owner).catch(() => null)) ??
+    (await resolveGitHubWebBaseUrl(ctx.organizationId, owner).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/github/github-application.service"); return null; })) ??
     "https://github.com";
   const cloneOrigin = webBaseUrl.replace(/^https:\/\//, "").replace(/\/+$/, "");
   const cloneUrl = `https://x-access-token:${token}@${cloneOrigin}/${owner}/${repo}.git`;

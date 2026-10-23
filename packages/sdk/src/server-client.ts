@@ -1,5 +1,6 @@
 import {
   ResourceIdSchema,
+  ServerMonitorFormatSchema,
   parseInput,
   ServerCollectionSchemas,
   ServerResourceSchemas,
@@ -15,6 +16,15 @@ import { createRemoteResourceOperations, createRemoteScopedOperations } from "./
 
 export function createRemoteServerOperations(http: HttpClient): ServerOperations {
   const path = (id: string) => `/system/servers/${encodeURIComponent(id)}`;
+  const installSessionQuery = (command: unknown) => {
+    const input = parseInput(ServerInstallSessionInputSchema, command ?? {});
+    const params = new URLSearchParams();
+    // Released servers read `id`; keep that wire alias while the shared public
+    // contract uses sessionId. New servers accept both without ambiguity.
+    if (input.sessionId) params.set("id", input.sessionId);
+    if (input.serverId) params.set("serverId", input.serverId);
+    return params.size ? `?${params}` : "";
+  };
   const clusterPath = (input?: unknown) =>
     `/system/clusters/${encodeURIComponent((input as { clusterId: string }).clusterId)}`;
   const networkPath = (input?: unknown) =>
@@ -208,6 +218,8 @@ export function createRemoteServerOperations(http: HttpClient): ServerOperations
     }),
     ...createRemoteResourceOperations(http, ServerResourceSchemas, {
       infrastructure: { method: "GET", path: (id) => path(id) + "/infrastructure" },
+      inspectSwarm: { method: "GET", path: (id) => path(id) + "/swarm", inputLocation: "query" },
+      connectSwarm: { method: "POST", path: (id) => path(id) + "/swarm/connect" },
       inspectNetwork: { method: "POST", path: (id) => path(id) + "/network/inspect" },
       githubStatus: {
         method: "GET",
@@ -261,6 +273,24 @@ export function createRemoteServerOperations(http: HttpClient): ServerOperations
           `/containers/${encodeURIComponent((input as { component: string }).component)}/apply/session`,
       },
       usage: { method: "GET", path: id => path(id) + "/usage" },
+      managedInfo: { method: "GET", path: id => path(id) + "/managed/info" },
+      managedOutbound: { method: "GET", path: id => path(id) + "/managed/outbound", redactInvalidResponse: true },
+      managedOutboundOptions: { method: "GET", path: id => path(id) + "/managed/outbound/options", redactInvalidResponse: true },
+      setManagedOutbound: { method: "PATCH", path: id => path(id) + "/managed/outbound", redactInvalidResponse: true },
+      managedBootLogs: { method: "POST", path: id => path(id) + "/managed/boot-logs" },
+      managedSshStatus: { method: "GET", path: id => path(id) + "/managed/ssh" },
+      setManagedSsh: { method: "PATCH", path: id => path(id) + "/managed/ssh", redactInvalidResponse: true },
+      setManagedSshKey: { method: "PUT", path: id => path(id) + "/managed/ssh/key" },
+      setManagedSshPassword: { method: "PUT", path: id => path(id) + "/managed/ssh/password" },
+      managedSshConnection: { method: "POST", path: id => path(id) + "/managed/ssh/connection", redactInvalidResponse: true },
+      managedRuntimeStatus: { method: "GET", path: id => path(id) + "/managed/runtime-api" },
+      enableManagedRuntime: { method: "POST", path: id => path(id) + "/managed/runtime-api/enable" },
+      managedRuntimeCredential: { method: "POST", path: id => path(id) + "/managed/runtime-api/credential", redactInvalidResponse: true },
+      rotateManagedRuntimeCredential: { method: "POST", path: id => path(id) + "/managed/runtime-api/rotate", redactInvalidResponse: true },
+      managedWorkloads: { method: "GET", path: id => path(id) + "/managed/workloads" },
+      managedWorkloadLogs: { method: "POST", path: id => path(id) + "/managed/workloads/logs" },
+      createManagedWorkload: { method: "POST", path: id => path(id) + "/managed/workloads" },
+      controlManagedWorkload: { method: "POST", path: id => path(id) + "/managed/workloads/control" },
       getNetworkSettings: { method: "GET", path: id => path(id) + "/network-settings" },
       updateNetworkSettings: { method: "PATCH", path: id => path(id) + "/network-settings" },
       ensure: { method: "POST", path: id => path(id) + "/ensure" },
@@ -305,12 +335,7 @@ export function createRemoteServerOperations(http: HttpClient): ServerOperations
       getInstallSession: {
         method: "GET",
         inputLocation: "path",
-        path: (input) => {
-          const { sessionId } = input as { sessionId?: string };
-          return (
-            "/system/install/session" + (sessionId ? `?id=${encodeURIComponent(sessionId)}` : "")
-          );
-        },
+        path: (input) => "/system/install/session" + installSessionQuery(input),
       },
       respondToInstall: { method: "POST", path: () => "/system/install/respond" },
     }),
@@ -366,16 +391,15 @@ export function createRemoteServerOperations(http: HttpClient): ServerOperations
       });
     },
     async *installEvents(command = {}, options = {}) {
-      const input = parseInput(ServerInstallSessionInputSchema, command);
       yield* http.events(
-        "/system/install/stream" +
-          (input.sessionId ? `?id=${encodeURIComponent(input.sessionId)}` : ""),
+        "/system/install/stream" + installSessionQuery(command),
         { signal: options.signal },
       );
     },
     async *monitor(value, options = {}) {
       const id = parseInput(ResourceIdSchema, value);
-      yield* http.events(`/system/monitor/stream?serverId=${encodeURIComponent(id)}`, {
+      const format = options.format === undefined ? "" : `&format=${parseInput(ServerMonitorFormatSchema, options.format)}`;
+      yield* http.events(`/system/monitor/stream?serverId=${encodeURIComponent(id)}${format}`, {
         signal: options.signal,
       });
     },

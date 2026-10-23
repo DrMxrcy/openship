@@ -11,15 +11,23 @@ export function cloudDeployFailure(failure: {
   projectId?: string | null;
 }): ApiError | null {
   const code = failure.errorCode;
-  if (code !== "CLOUD_CAPACITY_REQUIRED" && code !== "CLOUD_BILLING_BLOCKED" && code !== "PLAN_UPGRADE_REQUIRED") return null;
+  if (code !== "CLOUD_CAPACITY_REQUIRED" && code !== "CLOUD_WORKSPACE_BUILD_CAPACITY" && code !== "CLOUD_BILLING_BLOCKED" && code !== "PLAN_UPGRADE_REQUIRED") return null;
   const projectId = failure.projectId ?? failure.errorDetails?.projectId;
-  if (code === "CLOUD_CAPACITY_REQUIRED" && (typeof projectId !== "string" || !projectId)) return null;
-  return new ApiError(code === "CLOUD_CAPACITY_REQUIRED" ? 409 : 402, "Cloud deployment needs attention", {
+  const capacity = code === "CLOUD_CAPACITY_REQUIRED" || code === "CLOUD_WORKSPACE_BUILD_CAPACITY";
+  if (capacity && (typeof projectId !== "string" || !projectId)) return null;
+  return new ApiError(capacity ? 409 : 402, "Cloud deployment needs attention", {
     ...failure.errorDetails,
     code,
     projectId,
     ...(failure.errorMessage ? { error: failure.errorMessage } : {}),
   });
+}
+
+/** Capacity refusals share a persistent action, separate from payment recovery. */
+export function cloudDeployCapacityFailure(failure: Parameters<typeof cloudDeployFailure>[0]): ApiError | null {
+  const error = cloudDeployFailure(failure);
+  return error && (failure.errorCode === "CLOUD_WORKSPACE_BUILD_CAPACITY" || cloudCapacityRestriction(error))
+    ? error : null;
 }
 
 export interface CloudCapacityRestriction {
@@ -73,17 +81,19 @@ export function cloudCapacityRestriction(error: unknown): CloudCapacityRestricti
 export interface CloudDeployRestriction {
   code: "CLOUD_BILLING_BLOCKED" | "PLAN_UPGRADE_REQUIRED";
   reason?: string;
+  message?: string;
 }
 
 /** Only an explicit deployment refusal can open pricing. Provider failures,
  * connectivity errors and ordinary permissions failures keep their own recovery. */
 export function cloudDeployRestriction(error: unknown): CloudDeployRestriction | null {
   if (!(error instanceof ApiError) || error.status !== 402) return null;
-  const body = error.body as { code?: unknown; reason?: unknown } | null;
+  const body = error.body as { code?: unknown; reason?: unknown; error?: unknown } | null;
   if (body?.code !== "CLOUD_BILLING_BLOCKED" && body?.code !== "PLAN_UPGRADE_REQUIRED") return null;
   return {
     code: body.code,
     ...(typeof body.reason === "string" ? { reason: body.reason } : {}),
+    ...(typeof body.error === "string" ? { message: body.error } : {}),
   };
 }
 

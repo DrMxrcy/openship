@@ -21,6 +21,7 @@ import { Icon as UiIcon } from "@repo/ui/icons";
  */
 
 import { Suspense, useEffect } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { usePlatform } from "@/context/PlatformContext";
 import { useCloud } from "@/context/CloudContext";
@@ -29,6 +30,7 @@ import { useI18n } from "@/components/i18n-provider";
 
 import { BuildPreferences } from "./_components/BuildPreferences";
 import { AppearanceSetting } from "./_components/AppearanceSetting";
+import { AppearanceEditor } from "@/components/appearance/AppearanceEditor";
 import { RoutePreferences } from "./_components/RoutePreferences";
 import { DeployDefaults } from "./_components/DeployDefaults";
 import { CloudConnection } from "./_components/CloudConnection";
@@ -52,6 +54,7 @@ import { NotificationsTab } from "./_components/NotificationsTab";
 import { EmailSettings } from "./_components/EmailSettings";
 import { Credentials } from "./_components/Credentials";
 import { DataTransferTab } from "./_components/DataTransferTab";
+import { InstanceLocation } from "@/components/instance/InstanceLocation";
 import {
   SettingsSidebar,
   SettingsMobileTabs,
@@ -81,6 +84,9 @@ function SettingsPageInner() {
   const { t } = useI18n();
   const searchParams = useSearchParams();
   const { activeTab } = useSettingsTabs();
+  // Customization is a nested General view; retain the original preview URL too.
+  const customizeAppearance = activeTab === "general" &&
+    (searchParams.get("view") === "appearance" || searchParams.get("tab") === "appearance");
 
   /**
    * Openship Mail drops the cards that only a deploy platform has a use for —
@@ -133,7 +139,7 @@ function SettingsPageInner() {
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-6 mt-4 lg:mt-0">
         {/* ── ACTIVE TAB CONTENT (left, primary) ── */}
         <div className="space-y-6 min-w-0">
-          {activeTab === "general" && (
+          {activeTab === "general" && !customizeAppearance && (
             <>
               <AppearanceSetting />
               {/* Deploy Defaults + Routing hidden for now — advanced/rarely-needed,
@@ -147,6 +153,16 @@ function SettingsPageInner() {
                   Renders nothing on the SaaS. */}
               <ProductViewSetting />
               <PreferencesSetting />
+            </>
+          )}
+
+          {customizeAppearance && (
+            <>
+              <Link href="/settings" className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
+                <UiIcon name="arrow-left" className="size-4 rtl:rotate-180" />
+                {t.settings.appearance.backToGeneral}
+              </Link>
+              <AppearanceEditor />
             </>
           )}
 
@@ -201,6 +217,20 @@ function SettingsPageInner() {
 
           {activeTab === "instance" && (
             <>
+              {selfHosted && (
+                <InstanceLocation
+                  moveRequested={searchParams.get("move") === "1"}
+                  onMoveOpened={() => {
+                    const url = new URL(window.location.href);
+                    url.searchParams.delete("move");
+                    window.history.replaceState(
+                      window.history.state,
+                      "",
+                      `${url.pathname}${url.search}${url.hash}`,
+                    );
+                  }}
+                />
+              )}
               <InstanceInfo />
               {/* Instance-wide default product mode (Openship Mail vs the full
                   platform). Owner-gated inside; self-hosted only. */}

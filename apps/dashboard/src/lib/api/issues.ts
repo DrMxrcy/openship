@@ -25,6 +25,7 @@ export type IssueKind =
   | "prompt"
   | "partial_decision"
   | "routing_unsynced"
+  | "runtime_health"
   | "domain_unverified"
   | "ssl_error"
   | "port_advisory"
@@ -99,6 +100,7 @@ export interface IssueFeed {
   data: SystemIssue[];
   counts: IssueCounts;
   status: "open" | "resolved";
+  canClearHistory?: boolean;
 }
 
 type IssueCountsListener = (counts: IssueCounts, organizationId: string | null) => void;
@@ -200,6 +202,7 @@ export function runResolution(r: IssueResolution) {
 }
 
 export const issuesApi = {
+  clearHistory: () => api.delete<{ data: { deleted: number } }>(endpoints.issues.clearHistory),
   /** Open issues (default) or resolved incident history. */
   list: async (status: "open" | "resolved" = "open") => {
     const organizationId = getActiveOrganizationId();

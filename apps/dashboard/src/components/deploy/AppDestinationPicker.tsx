@@ -21,6 +21,7 @@ export interface AppDestination {
   /** Display name of the selected server, so a summary can name the destination
    *  the operator recognises instead of re-fetching the server row for it. */
   serverName?: string;
+  hasGpu?: boolean;
 }
 
 /** Catalog apps use the same acquired/connected server destinations as source projects. */
@@ -31,6 +32,8 @@ export function AppDestinationPicker({
   readOnly = false,
   disabledReason,
   onReadyChange,
+  needsGpu = false,
+  selfHostedOnly = false,
 }: {
   value: AppDestination | null;
   onChange: (d: AppDestination) => void;
@@ -38,6 +41,8 @@ export function AppDestinationPicker({
   readOnly?: boolean;
   disabledReason?: string;
   onReadyChange?: (ready: boolean) => void;
+  needsGpu?: boolean;
+  selfHostedOnly?: boolean;
 }) {
   const { t } = useI18n();
   const { selfHosted } = usePlatform();
@@ -54,14 +59,17 @@ export function AppDestinationPicker({
       autoSelectFirst
       useSavedDefault
       compact
+      needsGpu={needsGpu}
+      selfHostedOnly={selfHostedOnly}
       onSelect={(server) => {
         if (!server && selfHosted) return;
         onChange({
-          deployTarget: server?.raw.managed || !selfHosted ? "cloud" : "server",
+          deployTarget: server ? (server.raw.managed ? "cloud" : "server") : "cloud",
           serverId: server?.id,
           workspaceId: server?.raw.managed?.id,
           serverHost: server?.host,
           serverName: server?.name,
+          hasGpu: server?.raw.gpu?.available === true,
         });
       }}
     />

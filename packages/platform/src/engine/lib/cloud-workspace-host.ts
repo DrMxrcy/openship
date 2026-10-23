@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import {
   CloudDockerRuntime,
   CloudServerConnection,
@@ -6,7 +7,6 @@ import {
   cloudDockerProjectPaths,
   cloudWorkspaceStatus,
   dockerProjectStorage,
-  Oblien,
   sq,
   type ResourceConfig,
 } from "@repo/adapters";
@@ -21,6 +21,7 @@ import { getNamespaceClient } from "./openship-cloud";
 import { readCloudWorkspaceAllocation } from "./cloud-capacity";
 import { createProvisionLock } from "./provision-lock";
 import { cacheStore } from "./cache-store/index";
+import { decideCloudBuildResources } from "./cloud-build-resources";
 import { sampleServerUsage, unavailableServerUsage } from "./server-usage";
 import { registryAuthResolver } from "../modules/credentials/registry-auth";
 export { unavailableServerUsage as unavailableWorkspaceUsage } from "./server-usage";
@@ -30,15 +31,15 @@ export async function readCloudWorkspaceHost(organizationId: string, id: string)
   const owner = await requireCloudWorkspace(organizationId, id);
   if (!env.CLOUD_MODE) {
     const connection = await remoteServerConnection(organizationId, id);
-    const client = new Oblien({ token: connection.token, baseUrl: connection.providerApiUrl });
+    const { client } = await getNamespaceClient(organizationId, id, connection);
     const workspace = await client.workspaces.get(connection.workspaceId);
-    if (workspace.namespace !== connection.namespace) throw new AppError("Cloud server namespace changed", 409, "CLOUD_NAMESPACE_MISMATCH");
+    if (workspace.namespace !== connection.namespace) throw new AppError("Cloud space ownership changed", 409, "CLOUD_NAMESPACE_MISMATCH");
     if (workspace.id !== connection.workspaceId)
-      throw new AppError("Cloud returned a different managed server", 502, "CLOUD_SERVER_IDENTITY_MISMATCH");
+      throw new AppError("Cloud returned a different Cloud space", 502, "CLOUD_SERVER_IDENTITY_MISMATCH");
     const binding = await repos.cloudDockerWorkspace.find({ ownerWorkspaceId: id }, organizationId);
     return { owner, binding, provider: { workspace, allocation: connection.resources }, credentials: { client, namespace: connection.namespace } };
   }
-  if (owner.remote) throw new AppError("Invalid Cloud server authority", 409, "CLOUD_SERVER_LINK_INVALID");
+  if (owner.remote) throw new AppError("The Cloud space connection could not be verified", 409, "CLOUD_SERVER_LINK_INVALID");
   const binding = await repos.cloudDockerWorkspace.find({ ownerWorkspaceId: id }, organizationId);
   if (!binding?.workspaceId) return { owner, binding, provider: null, credentials: null };
   if (!owner.namespace || binding.namespace !== owner.namespace)
@@ -51,7 +52,7 @@ export async function readCloudWorkspaceConnection(organizationId: string, id: s
   const { owner, binding, provider, credentials } = await readCloudWorkspaceHost(organizationId, id);
   if (!binding?.workspaceId || !provider)
     throw new AppError(
-      "The managed server has not been provisioned yet",
+      "Your Cloud space is not set up yet. Complete setup to continue.",
       409,
       "CLOUD_WORKSPACE_NOT_READY",
     );
@@ -64,7 +65,7 @@ async function runningConnection(organizationId: string, id: string) {
   const connection = await readCloudWorkspaceConnection(organizationId, id);
   if (!["running", "active"].includes(cloudWorkspaceStatus(connection.provider.workspace)))
     throw new AppError(
-      "The server is stopped. Resume it to read live usage.",
+      "Your Cloud space is stopped. Resume it to view resource usage.",
       409,
       "CLOUD_WORKSPACE_NOT_RUNNING",
     );
@@ -75,7 +76,7 @@ async function runningConnection(organizationId: string, id: string) {
  * a host or installing the Docker API bridge just to read metrics/open a shell. */
 export async function openCloudWorkspaceExecutor(organizationId: string, id: string) {
   const { client, binding } = await runningConnection(organizationId, id);
-  return new CloudWorkspaceExecutor(() => client.workspace(binding.workspaceId!).runtime(), binding.workspaceId!);
+  return new CloudWorkspaceExecutor(options => client.workspace(binding.workspaceId!).runtime(options), binding.workspaceId!);
 }
 
 /** Server-authorized Docker operations (inventory and migration). Applications
@@ -91,7 +92,11 @@ export async function openCloudWorkspaceDockerRuntime(organizationId: string, id
       transport: "cloud", executor: connection.executor,
       cloudConnection: () => connection.connectDocker(),
       resolveRegistryAuth: registryAuthResolver(organizationId),
-    });
+      buildCacheProtection: async () => {
+        const { buildCacheProtection } = await import("./build-cache-protection");
+        return buildCacheProtection(organizationId, id);
+      },
+    }, null, createProvisionLock(`cloud:server:${binding.workspaceId}`));
     const dispose = runtime.dispose.bind(runtime);
     runtime.dispose = async () => {
       try { await dispose(); } finally { await connection.dispose(); }
@@ -117,10 +122,11 @@ async function measuredHost(organizationId: string, id: string) {
   return { runtime, capacity: provider.allocation };
 }
 
-/** Build admission needs only a cheap host sample, never a filesystem scan. */
-export async function sampleCloudWorkspaceResources(organizationId: string, id: string) {
+/** Read verified host allocation; sample live usage only for configured caps. */
+export async function sampleCloudWorkspaceResources(organizationId: string, id: string, sampleUsage = true) {
   const { client, binding, provider } = await runningConnection(organizationId, id);
-  const executor = new CloudWorkspaceExecutor(() => client.workspace(binding.workspaceId!).runtime(), binding.workspaceId!);
+  if (!sampleUsage) return { capacity: provider.allocation, usage: unavailableServerUsage("Not sampled for an uncapped build") };
+  const executor = new CloudWorkspaceExecutor(options => client.workspace(binding.workspaceId!).runtime(options), binding.workspaceId!);
   try {
     return { capacity: provider.allocation, usage: await sampleServerUsage(executor) };
   } finally {
@@ -147,7 +153,21 @@ export async function measureCloudWorkspace(
   try {
     const [sample, storage, localProjects] = await Promise.all([
       sampleServerUsage(runtime.executor),
-      withTimeout(runtime.docker.df(), 15_000, "Storage inventory timed out").catch(() => null),
+      (async () => {
+        const info = await withTimeout(
+          runtime.docker.info(),
+          5_000,
+          "Storage driver inspection timed out",
+        );
+        // fuse-overlayfs sizes writable layers by walking both full directory
+        // trees in daemon memory. A caller timeout does not stop that work.
+        // Keep host totals available; detailed attribution stays unknown.
+        if (info.Driver === "fuse-overlayfs") return null;
+        return withTimeout(runtime.docker.df(), 15_000, "Storage inventory timed out");
+      })().catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "platform/engine/lib/cloud-workspace-host");
+        return null;
+      }),
       repos.project.listByWorkspace(id, organizationId),
     ]);
     const projects = [...new Map([
@@ -155,7 +175,7 @@ export async function measureCloudWorkspace(
       ...localProjects,
     ].map(project => [project.id, project])).values()];
     const disk = storage ? dockerProjectStorage(storage, projects) : [];
-    const paths = projects.map((project) => cloudDockerProjectPaths(project.id).mounts);
+    const paths = storage ? projects.map((project) => cloudDockerProjectPaths(project.id).mounts) : [];
     const bindSizes = paths.length
       ? await runtime.executor
           .exec(
@@ -163,7 +183,7 @@ export async function measureCloudWorkspace(
             { timeout: 15_000 },
           )
           .then((raw) => raw.trim().split("\n"))
-          .catch(() => [])
+          .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/lib/cloud-workspace-host"); return []; })
       : [];
     const members = [];
     for (const [index, project] of projects.entries()) {
@@ -192,36 +212,39 @@ export async function measureCloudWorkspace(
   }
 }
 
-/** Container caps are ceilings, not reserved VMs. A serial build uses currently
- * available memory/CPU inside the purchased host, without allocating another VM. */
+/** Admission ledger only. This result must not replace the user's build caps.
+ * Uncapped dimensions stay shared; only explicit caps reserve capacity. */
 export function workspaceBuildResources(
   capacity: ResourceConfig,
   usage: CloudWorkspaceUsage,
   requested?: Partial<ResourceConfig>,
 ): ResourceConfig {
-  if (!usage.available || usage.memoryAvailableMb === null || usage.cpuPercent === null)
+  const decision = decideCloudBuildResources({ capacity, usage, requested, reservations: [] });
+  if (decision.kind === "admit") return { ...decision.resources, diskMb: capacity.diskMb };
+  if (decision.kind === "impossible" && decision.reason === "invalid-request")
+    throw new AppError(
+      "Choose automatic build resources or specify at least 0.25 vCPU and 128 MB of memory.",
+      400,
+      "CLOUD_BUILD_RESOURCES_INVALID",
+    );
+  if (
+    decision.kind === "wait" &&
+    ["usage-unavailable", "capacity-unavailable"].includes(decision.reason)
+  )
     throw new AppError(
       "Couldn't measure the server's available build capacity. Retry after the server is reachable.",
       503,
       "CLOUD_WORKSPACE_USAGE_UNAVAILABLE",
     );
-  const headroomMb = Math.min(512, Math.max(128, capacity.memoryMb * 0.05));
-  const availableMb = Math.floor(Math.min(capacity.memoryMb, usage.memoryAvailableMb) - headroomMb);
-  if (availableMb < 128)
+  if (decision.kind === "wait" && decision.reason === "memory-pressure")
     throw new AppError(
-      "The server has too little free memory to build safely. Stop an idle app or increase the server's capacity, then retry.",
+      "The server has too little free memory to build safely. Stop an idle app, lower the build allocation, or increase the server's capacity, then retry.",
       409,
       "CLOUD_WORKSPACE_BUILD_CAPACITY",
     );
-  return {
-    cpuCores: Math.min(
-      requested?.cpuCores || capacity.cpuCores,
-      Math.max(
-        0.25,
-        Math.floor(capacity.cpuCores * (1 - Math.min(100, usage.cpuPercent) / 100) * 4) / 4,
-      ),
-    ),
-    memoryMb: Math.min(requested?.memoryMb || availableMb, availableMb),
-    diskMb: capacity.diskMb,
-  };
+  throw new AppError(
+    "The requested build allocation cannot fit the server's available capacity. Stop an idle app, lower the build allocation, or increase the server's capacity, then retry.",
+    409,
+    "CLOUD_WORKSPACE_BUILD_CAPACITY",
+  );
 }

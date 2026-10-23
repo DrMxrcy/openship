@@ -43,7 +43,16 @@ server; the provider namespace permits one VM. Saved paid contracts keep their
 own limits. Disk usage is measured from the filesystem and Docker inventory. Shared
 images, caches and system files are reported separately from project data.
 
-A source build uses measured free CPU and memory, with operating-system headroom.
+Source builds receive only the user's saved CPU and memory caps. Missing or zero
+values impose no additional Docker limits, including on managed servers. Catalog
+sizing recommendations never become service settings during install or Retry.
+
+Admission reserves a full host dimension for an uncapped build dimension, so an
+uncapped build cannot overlap another build on the same server. These reservations
+remain independent of the limits sent to Docker. Automatic builds read verified
+VM allocation without sampling idle CPU or free RAM; explicitly capped builds
+retain live admission checks. Plan concurrency is still a ceiling, not a request
+to subdivide a build or provision another VM.
 Builds and host changes coordinate through the existing server activity lock.
 A resize stores the prior host state and running container/process identities
 before asking Oblien to change resources. Recovery continues after a lost response
@@ -60,7 +69,9 @@ has ended can enter host deletion. Financial history remains with the provider.
 - `serverId`, subscription, namespace and project ownership are checked before
   opening the provider connection. A Cloud request cannot fall through to the
   control plane's local Docker socket or filesystem.
-- Provider credentials and runtime tokens stay server-side. Source uploads must
+- Provider account and namespace credentials stay server-side. An explicit
+  server-admin operation can reveal a workspace-only Runtime API token or a
+  short-lived SSH credential. Source uploads must
   belong to the same organization, project and server; a stored local path is not
   authorization to transfer a control-plane directory.
 - Host activity uses `cloud:workspace-activity:<subscription>`. Runtime/route
@@ -136,3 +147,125 @@ ID; reads return saved command, environment and labels; Start/Stop persist
 `enabled`; stopped processes stay stopped
 after restarting the server. SDK type checking and simulated responses do not
 prove these live provider guarantees.
+
+
+## Cloud space presentation
+
+Cloud navigation presents managed capacity as **Cloud spaces**. One existing Cloud
+workspace remains one independent resource pool, with the same subscription,
+allocation, projects, provisioning and execution adapters. Overview shows the
+existing usage sample and assigned projects; Activity shows lifecycle progress
+and explicit retry. Independent pools are not summed into a fictitious allocation.
+Capacity changes use the existing billing review flow.
+
+The managed UI omits host terminals, SSH, networking, Runtime API credentials and
+manual process controls, including when opened through Desktop or an old
+`/servers/:id` link. Connected self-hosted servers keep their host tools. Project
+logs, service consoles, deployments and routing remain available in their project.
+
+This is a presentation change. It does not restrict or remove existing HTTP/SDK
+operations, change authorization, migrate projects, revoke credentials or alter
+runtime limits. Legacy Desktop execution connections continue to work. Hiding a
+control in the UI is not a new security boundary.
+
+## Existing host APIs
+
+The host API and native/HTTP SDK continue to use `ManagedServerResourceSchemas`,
+the existing authorization layer, and the same namespace-bound provider connection
+as deployments. Their behavior is unchanged by the Cloud spaces UI:
+
+- Settings reports the actual managed image and allocation, and offers bounded
+  boot logs. Application image changes stay in project deployment settings;
+  replacing the VM image, changing paid resources directly, and destructive TTLs
+  are deliberately not controls on an active shared managed server.
+- SSH supports enable/disable, one authorized public key, password replacement,
+  and temporary connections. Passwords and keys never enter server overview or
+  audit payloads. Provider sharing restrictions are honored.
+- Runtime API status never enables it. Credential reveal and rotation require
+  server-admin authorization and a confirmed request. Rotation compares a hash
+  of the current underlying token under the activity lock. A retry after a lost
+  success response cannot rotate it again with the old revision. The Runtime API
+  is required by Openship; the dashboard does not offer to disable it.
+- Native workloads distinguish platform services, project-owned releases and
+  manual processes. Only manual processes created by this interface can be
+  started, stopped or deleted here. A deterministic ID and request fingerprint
+  recover lost create replies without duplicating a process. Creation saves a
+  stopped process; starting it is a separate explicit action. Process environment
+  and command text are never included in lists or audits.
+- Outbound rules use an optimistic revision and a narrow patch. Routes, private
+  peers, ingress rules and proxy credentials are never round-tripped by this form.
+  Disabling internet clears egress in the provider; re-enabling it explicitly
+  sends the displayed destination list. Wildcard ingress is represented as such.
+
+Mutations reauthorize after acquiring managed workspace activity admission, so
+linked controllers, deployments and terminals retain their existing coordination.
+New execution/access requires authoritative paid entitlement; revocation does not.
+Unconfirmed provider results are errors, and unknown process observations are not
+reported as stopped. These controls do not promise a distributed SQL/provider
+transaction: uncertain replies are recovered by reading state and retaining the
+original identity or revision.
+
+Secret responses carry `Cache-Control: private, no-store`. The dashboard holds
+credentials in component memory for at most one minute, clears them when hidden,
+and ignores responses from a previous account/server/tab. Gateway tokens grant
+root-equivalent access to this server, not project-scoped access. Direct SSH/SDK
+clients run outside Openship's deployment queue; administrators must coordinate
+their own commands with application work.
+
+The provider Runtime endpoint defaults to `https://workspace.oblien.com` and can
+be overridden with `OBLIEN_RUNTIME_URL`. All provider methods used here are in
+Oblien SDK 2.10.0; no new provider SDK release is required. Deploy the Openship API
+and dashboard from the same release to use the new controls. Existing server
+response shapes are unchanged. Detailed network reads opt in with
+`getNetworkSettings(id, { details: true })` / `?details=true`; writes return
+diagnostics only when the caller supplies `expectedRevision`, preserving the
+original internet-only contract for older clients.
+
+## Live resource usage
+
+The Cloud spaces page calls each independently purchased allocation a **Cloud space**.
+A compact picker in the right column shows the plan, project count and state. Usage and plan capacity stay
+scoped to the selected space; projects cannot combine several allocations.
+
+`GET /api/system/monitor/stream?serverId=…&format=usage` and
+`ship.servers.monitor(id, { format: "usage", signal })` opt into `usage` events.
+The default host `stats` events and existing host operations remain unchanged.
+Each event contains `ResourceUsageSample`: a measurement timestamp, quota-relative
+CPU percentage, memory used/available in MB and disk used/available/total in MB.
+Unknown fields stay null. Actual guest bytes are converted to MB; allocation,
+credits, CPU time and memory reservation are not treated as live consumption.
+See the [provider metrics contract](https://oblien.com/docs/api/metrics).
+
+Guest byte counters and guest KiB counters are accepted. Zero-total placeholders
+are unavailable measurements. Hypervisor process memory includes VM overhead and
+is never substituted for guest RAM. When a guest does not publish memory metrics,
+the stream uses the existing read-only guest sampler, at most once per ten seconds
+per subscription; it closes that connection on cancellation or failure.
+
+Openship verifies server-read access and the existing organization/workspace binding,
+then opens the stream with that workspace's namespace credentials. It never exposes
+provider credentials to the browser or provisions/resumes a machine to observe usage.
+The operation rechecks authorization before each delivered event. Provider streams
+reject credential redirects, bound idle reads/incomplete frames and close on abort.
+Desktop's saved managed links use the same verified Cloud connection as existing reads.
+
+The dashboard subscribes only while the selected usage view is visible, cancels on
+space/account changes and keeps up to 60 recent samples. Failed or stalled reads show
+Retry and a last-reading label. Project membership and disk breakdown keep their existing
+permission-filtered snapshot request; the live stream does not repeat Docker storage scans.
+Deploy the API and dashboard together for live usage; older APIs retain snapshot usage
+with an explicit unavailable-live-updates notice.
+
+On `fuse-overlayfs`, the snapshot request skips Docker's full disk-usage inventory.
+Its writable-layer sizing walks directory trees in daemon memory, and a caller
+timeout does not reliably stop that scan. Host CPU, memory, total disk usage and
+project membership remain available; detailed project/shared disk attribution is
+null rather than zero on these hosts. Other storage drivers keep their existing
+disk breakdown. This read never prunes caches or changes application resources.
+
+Cloud spaces owns instant resource readings and project storage; Billing shows the
+subscription, payments, usage over the billing period and entitlement counters.
+Both reuse the shared destination picker, catalog names and existing billing scope.
+Billing does not fetch a second host snapshot. View links carry the selected execution
+identity; Manage plan links carry its subscription identity. Setup links retain Activity.
+The existing `/resources` URLs and saved `/servers/:id` links remain compatible.

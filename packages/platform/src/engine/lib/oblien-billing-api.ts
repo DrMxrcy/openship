@@ -1,3 +1,4 @@
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { z } from "zod";
 import { AppError } from "@repo/core";
 import { OperationError } from "@repo/contracts";
@@ -12,6 +13,20 @@ const allowance = amount.nonnegative().nullable();
 const date = z.string().refine((value) => Number.isFinite(Date.parse(value))).nullable();
 const namespace = z.string().min(1).max(128);
 const timestamp = (value: string | null) => value === null ? null : Date.parse(value);
+// The live credit meter, distinct from proposed rate cards or monthly capacity.
+// Actions offers sell 100 credits per dollar; reject a changed conversion rather
+// than silently quote a different purchasing power.
+export const oblienMeteredPricingSchema = z.object({
+  success: z.literal(true),
+  credits_per_dollar: z.literal(100),
+  rate_card_id: z.string().min(1),
+  rates: z.object({
+    cpu_per_min: amount.positive(),
+    memory_per_gb_min: amount.positive(),
+    disk_per_gb: amount.nonnegative(),
+    network_per_gb: amount.nonnegative(),
+  }),
+});
 // These validation refusals occur before a checkout is opened. Use the original
 // provider status: an operator's funding or eligibility error is presented as 503.
 const REJECTED_CHECKOUT_CODES = new Set([
@@ -26,6 +41,8 @@ export const oblienCatalogSchema = z.object({
   reseller: z
     .object({
       contractVersion: amount.int().positive(),
+      checkoutCancellation: z.boolean().optional(),
+      serviceOffers: z.boolean().optional(),
       offerPolicy: z.boolean(),
       resourceLimits: z.boolean(),
       effectiveResourceLimits: z.boolean().optional(),
@@ -72,8 +89,9 @@ export const oblienEntitlementSchema = z.object({
   tierId: z.string().nullable(),
   status: z.enum(["active", "past_due", "canceled", "credit_exhausted"]),
   periodStart: date, periodEnd: date,
-  billingMode: computeBillingModeSchema.optional(),
+  billingMode: z.enum(["monthly", "payg", "service"]).optional(),
   computeCovered: z.boolean().optional(),
+  serviceCovered: z.boolean().optional(),
   capacity: oblienNamespaceCapacitySchema.nullable().optional(),
   // Preserve signed legacy usage; the provider's limit includes purchased credits.
   quota: z.object({
@@ -113,7 +131,7 @@ export const oblienOfferSchema = z.object({
   description: z.string().max(500).optional(),
   unitAmount: amount.int().nonnegative().max(1_000_000),
   currency: z.literal("usd"),
-  billingMode: computeBillingModeSchema.optional(),
+  billingMode: z.enum(["monthly", "payg", "service"]).optional(),
   capacity: oblienCapacityPoolSchema.optional(),
   tariffId: z.string().min(1).optional(),
   credits: amount.int().min(0).max(1_000_000_000),
@@ -131,7 +149,10 @@ export const oblienOfferSchema = z.object({
   // the reseller's wallet to fund its capacity before granting coverage.
   if (value.unitAmount < 100 && !(value.unitAmount === 0 && value.billingMode === "monthly"))
     ctx.addIssue({ code: "custom", path: ["unitAmount"], message: "Offers require at least 100 cents unless monthly capacity is fully sponsored" });
-  if (value.billingMode === "monthly") {
+  if (value.billingMode === "service") {
+    if (value.credits !== 0 || value.capacity !== undefined || value.tariffId !== undefined || value.policy !== undefined || value.resourceLimits !== undefined)
+      ctx.addIssue({ code: "custom", message: "Service offers cannot grant compute credits or capacity" });
+  } else if (value.billingMode === "monthly") {
     if (!value.capacity || value.credits !== 0 || value.policy !== undefined)
       ctx.addIssue({ code: "custom", message: "Monthly capacity requires a pool, zero credits and no credit policy" });
   } else if (value.credits <= 0 || value.capacity !== undefined || value.tariffId !== undefined) {
@@ -285,12 +306,13 @@ export class OblienBillingApi {
   }
 
   private async request<T>({ method, path, body, query }: Parameters<Oblien["_http"]["request"]>[0]): Promise<T> {
-    if (!path.startsWith("/billing/")) throw new Error("Billing transport only accepts billing routes");
+    const meteredPricing = method === "GET" && path === "/pricing/calculator";
+    if (!path.startsWith("/billing/") && !meteredPricing) throw new Error("Billing transport only accepts billing routes");
     const url = new URL(`${this.baseUrl}${path}`);
     for (const [key, value] of Object.entries(query ?? {})) {
       if (value !== undefined) url.searchParams.set(key, String(value));
     }
-    const publicRead = method === "GET" && (path === "/billing/catalog" || path === "/billing/capacity/catalog");
+    const publicRead = meteredPricing || (method === "GET" && (path === "/billing/catalog" || path === "/billing/capacity/catalog"));
     const headers: Record<string, string> = { Accept: "application/json" };
     if (!publicRead) {
       if (!this.options.clientId || !this.options.clientSecret) {
@@ -310,7 +332,8 @@ export class OblienBillingApi {
         redirect: "error",
       });
       payload = await response.json();
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "platform/engine/lib/oblien-billing-api");
       throw new AppError("Cloud billing is temporarily unavailable. Please retry.", 503, "OBLIEN_BILLING_UNAVAILABLE");
     }
     if (!response.ok || (payload as { success?: unknown } | null)?.success !== true) {
@@ -325,7 +348,7 @@ export class OblienBillingApi {
       const providerFailure = PROVIDER_FAILURES.has(code) || /^ER_[A-Z0-9_]+$/.test(code) ||
         (!checkoutExpired && ![400, 404, 409, 422, 429].includes(response.status));
       const status = providerFailure ? 503 : response.status;
-      console.warn("[oblien:billing] Provider request failed", {
+      errorDiagnostics.warn("platform/engine/lib/oblien-billing-api", "[oblien:billing] Provider request failed", {
         method,
         operation: path
           .replace(/^\/billing\/policy\/[^/]+/, "/billing/policy/:namespace")
@@ -348,6 +371,17 @@ export class OblienBillingApi {
         invalid_redirect_url: "Cloud billing requires a valid HTTPS return link. Contact Openship support.",
         billing_idempotency_conflict: "This checkout attempt no longer matches the original request. Contact Openship support before starting another payment.",
         billing_checkout_reconciliation_required: "An earlier checkout needs to be reviewed. Contact Openship support before starting another payment.",
+        capacity_checkout_pending:
+          "This Cloud space already has an unfinished purchase. Open Billing and complete or cancel it before starting another.",
+        capacity_checkout_limit:
+          "There are too many unfinished purchases. Open Billing and complete or cancel an existing purchase before starting another. If none is listed, contact Openship support.",
+        capacity_resource_update_pending:
+          "This Cloud space is still updating. Wait for the current operation to finish before changing its plan.",
+        billing_payment_mismatch:
+          "We could not verify this payment against your checkout. Contact Openship support before making another payment.",
+        checkout_cancellation_pending:
+          "Cancellation is still being confirmed. Refresh its status before starting another checkout.",
+        checkout_already_paid: "Payment already completed. Refresh its verification status.",
         checkout_expired: "This checkout has expired. Choose your plan again to start a new checkout.",
         capacity_checkout_expired: "This checkout has expired. Choose your plan again to start a new checkout.",
         invalid_offer: "This Cloud offer is not configured correctly. Contact Openship support.",
@@ -372,11 +406,12 @@ export class OblienBillingApi {
         insufficient_redeemable_balance: "Cloud server purchases are temporarily unavailable. Contact Openship support.",
       };
       const checkoutUnavailable = path === "/billing/checkout" && providerFailure;
+      const checkoutPending = !providerFailure && code === "capacity_checkout_pending";
       const message = Object.hasOwn(known, code) ? known[code]
         : checkoutUnavailable ? "Cloud checkout is temporarily unavailable. Please try again later."
           : "Cloud billing could not complete this request. Please retry.";
       throw new OperationError(diagnostic.reference ? `${message} Reference: ${diagnostic.reference}.` : message,
-        status, capacityUnavailable ? "CLOUD_CAPACITY_UNAVAILABLE"
+        status, checkoutPending ? "CLOUD_WORKSPACE_CHECKOUT_PENDING" : capacityUnavailable ? "CLOUD_CAPACITY_UNAVAILABLE"
           : checkoutUnavailable ? "OBLIEN_CHECKOUT_UNAVAILABLE" : "OBLIEN_BILLING_ERROR", {
           ...(Object.hasOwn(known, code) ? { providerCode: code } : {}),
           ...(checkoutExpired ? { checkoutExpired: true } : {}),
@@ -403,6 +438,12 @@ export class OblienBillingApi {
 
   getCapacityCatalog() {
     return this.validate(this.billing.capacityCatalog(), oblienCapacityCatalogSchema);
+  }
+
+  /** This public endpoint is not yet exposed by the SDK. Keep it on the same
+   * validated, bounded transport as the SDK's billing calls. */
+  getMeteredPricing() {
+    return this.validate(this.request({ method: "GET", path: "/pricing/calculator" }), oblienMeteredPricingSchema);
   }
 
   /** Sales check only. Existing contracts and renewal keep their saved tariff. */
@@ -434,9 +475,9 @@ export class OblienBillingApi {
     return this.validate(this.billing.entitlement(slug), oblienEntitlementSchema, slug);
   }
 
-  getCheckout(slug: string, checkoutId: string) {
+  private checkoutResponse(response: Promise<unknown>, slug: string, checkoutId: string) {
     return this.validate(
-      this.billing.checkoutStatus(slug, checkoutId),
+      response,
       z.object({
         success: z.literal(true),
         namespace,
@@ -461,6 +502,24 @@ export class OblienBillingApi {
         }),
       }),
       slug,
+    );
+  }
+
+  getCheckout(slug: string, checkoutId: string) {
+    return this.checkoutResponse(this.billing.checkoutStatus(slug, checkoutId), slug, checkoutId);
+  }
+
+  cancelCheckout(slug: string, checkoutId: string, input: { idempotencyKey: string }) {
+    // Use the existing authenticated, bounded transport until the provider SDK
+    // release includes this endpoint. Validate the original checkout identity.
+    return this.checkoutResponse(
+      this.request({
+        method: "POST",
+        path: `/billing/checkout/${encodeURIComponent(checkoutId)}/cancel`,
+        body: { namespace: slug, idempotencyKey: input.idempotencyKey },
+      }),
+      slug,
+      checkoutId,
     );
   }
 
@@ -492,7 +551,7 @@ export class OblienBillingApi {
   getBalance(slug: string) {
     return this.validate(this.billing.balance(slug), z.object({
       success: z.literal(true), namespace, blocking: z.boolean(), balance: amount.nullable(),
-      billingMode: computeBillingModeSchema.optional(), computeCovered: z.boolean().optional(), paidThrough: date.optional(),
+      billingMode: z.enum(["monthly", "payg", "service"]).optional(), computeCovered: z.boolean().optional(), paidThrough: date.optional(),
     }), slug);
   }
 
@@ -535,7 +594,9 @@ export class OblienBillingApi {
 
   async previewPlanChange(slug: string, input: OblienPlanChangeInput) {
     const request = oblienPlanChangeInputSchema.parse(input);
-    const result = await this.validate(this.billing.previewPlanChange(slug, request), z.object({
+    const result = await this.validate(request.offer.billingMode === "service"
+      ? this.request({ method: "POST", path: "/billing/subscription/changes/preview", body: { namespace: slug, ...request } })
+      : this.billing.previewPlanChange(slug, { ...request, offer: { ...request.offer, billingMode: request.offer.billingMode } }), z.object({
       success: z.literal(true), namespace, quote: oblienPlanChangeQuoteSchema,
     }), slug);
     if (result.quote.namespace !== slug || result.quote.billingInterval !== input.billingInterval)
@@ -583,7 +644,9 @@ export class OblienBillingApi {
     // and this saved namespace offer before creating the Stripe session.
     const parsed = oblienCheckoutInputSchema.parse(input);
     const request = { ...parsed, allowPromotionCodes: parsed.offer?.unitAmount !== 0 };
-    const result = await this.validate(this.billing.checkout(request), checkoutSchema);
+    const result = await this.validate(request.offer?.billingMode === "service"
+      ? this.request({ method: "POST", path: "/billing/checkout", body: request })
+      : this.billing.checkout({ ...request, offer: request.offer ? { ...request.offer, billingMode: request.offer.billingMode === "monthly" ? "monthly" : request.offer.billingMode === "payg" ? "payg" : undefined } : undefined }), checkoutSchema);
     this.validateCheckoutUrl(result.url);
     return result;
   }

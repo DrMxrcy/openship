@@ -6,10 +6,11 @@
  * accepts external SSH connections only as migration sources.
  */
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import type { Context } from "hono";
 import { repos } from "@repo/db";
 import type { MigrationSourceInput } from "@repo/contracts";
-import { AppError, NotFoundError, safeErrorMessage } from "@repo/core";
+import { AppError, NotFoundError, safeErrorMessage, type StackRole } from "@repo/core";
 import { getRequestContext } from "../../lib/request-context";
 import { permission } from "../../lib/permission";
 import { parseRevealKeys, pickRevealed } from "@repo/platform/engine/lib/env-reveal";
@@ -23,7 +24,12 @@ import {
   type DiscoveredService,
 } from "@repo/platform/engine/modules/migration/docker-inspect.service";
 import { adoptServerStack, reimportOpenshipProject, parseRepoCompose } from "@repo/platform/engine/modules/migration/migrate.service";
-import { assertProjectMovable, ProjectMoveRefused, type ProjectMoveIntent } from "@repo/platform/engine/modules/migration/project-move";
+import {
+  assertProjectMovable,
+  loadProjectRoleWork,
+  ProjectMoveRefused,
+  type ProjectMoveIntent,
+} from "@repo/platform/engine/modules/migration/project-move";
 import { maskEnv, maskServicesEnv } from "@repo/platform/engine/lib/secret-env";
 import { buildMigrationPreview } from "@repo/platform/engine/modules/migration/migration-preflight";
 import { migrationOrchestrator } from "@repo/platform/engine/modules/migration/migration.orchestrator";
@@ -232,6 +238,7 @@ export async function scanServerStream(c: Context) {
         data: JSON.stringify({ type: "result", stack: maskDiscoveredStack(stack) }),
       });
     } catch (err) {
+      observeCaughtError(err, "api/modules/migration/migration.controller");
       await s.writeSSE({
         event: "error",
         data: JSON.stringify({ type: "error", error: `Scan failed: ${safeErrorMessage(err)}` }),
@@ -252,7 +259,7 @@ export async function scanServerStream(c: Context) {
  */
 export async function revealServiceEnv(c: Context) {
   type RevealBody = { serverId?: string; containerId?: string; keys?: unknown };
-  const body = await c.req.json<RevealBody>().catch(() => ({}) as RevealBody);
+  const body = await c.req.json<RevealBody>().catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/migration/migration.controller"); return ({}) as RevealBody; });
   const { serverId, containerId } = body;
   if (!serverId) return c.json({ error: "serverId is required" }, 400);
   if (!containerId) return c.json({ error: "containerId is required" }, 400);
@@ -565,6 +572,8 @@ async function assertProjectMoveAllowed(
         serverId: string;
         workspaceId: string | null;
         runtimeMode: string | null;
+        roles: StackRole[] | null;
+        activeDeploymentId: string | null;
         isControlPlane: boolean;
       };
     }
@@ -593,6 +602,8 @@ async function assertProjectMoveAllowed(
       serverId: project.serverId,
       workspaceId: project.workspaceId ?? null,
       runtimeMode: project.runtimeMode ?? null,
+      roles: project.roles ?? null,
+      activeDeploymentId: project.activeDeploymentId ?? null,
       isControlPlane: isControlPlaneProject(project),
     },
   };
@@ -661,8 +672,14 @@ export async function startProjectMove(c: Context) {
         serverId: guard.project.serverId,
         workspaceId: guard.project.workspaceId,
         runtimeMode: guard.project.runtimeMode,
+        roles: guard.project.roles,
       },
       targetServerId: body.targetServerId,
+      roleWork: await loadProjectRoleWork({
+        id: guard.project.id,
+        organizationId: guard.organizationId,
+        activeDeploymentId: guard.project.activeDeploymentId,
+      }),
       isControlPlane: guard.project.isControlPlane,
       intent,
       serviceNames: scopedServices,
@@ -672,7 +689,7 @@ export async function startProjectMove(c: Context) {
         ? ((
             await repos.server
               .getInOrganization(guard.project.serverId, guard.organizationId)
-              .catch(() => null)
+              .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/migration/migration.controller"); return null; })
           )?.name ?? null)
         : null,
     });
@@ -834,7 +851,7 @@ export async function confirmCutover(c: Context) {
   const id = param(c, "id");
   const body = await c.req
     .json<{ confirmationToken?: string; kill?: boolean }>()
-    .catch(() => ({}) as { confirmationToken?: string; kill?: boolean });
+    .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/migration/migration.controller"); return ({}) as { confirmationToken?: string; kill?: boolean }; });
   if (!body.confirmationToken) {
     return c.json({ error: "confirmationToken is required" }, 400);
   }
@@ -908,7 +925,7 @@ export async function resumeMigration(c: Context) {
   const ctx = getRequestContext(c);
   const body = await c.req
     .json<{ overrides?: Record<string, string>; skip?: string[] }>()
-    .catch(() => ({}) as { overrides?: Record<string, string>; skip?: string[] });
+    .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "api/modules/migration/migration.controller"); return ({}) as { overrides?: Record<string, string>; skip?: string[] }; });
   const overrides = body.overrides && typeof body.overrides === "object" ? body.overrides : {};
   const skip = Array.isArray(body.skip) ? body.skip.filter((s) => typeof s === "string") : [];
   const result = await migrationOrchestrator.resume(ctx, param(c, "id"), ctx.organizationId, {

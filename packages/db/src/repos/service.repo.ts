@@ -2,20 +2,22 @@ import { eq, and, asc, inArray, or, sql } from "drizzle-orm";
 import {
   commandToArgv,
   generateId,
+  redactUrlCredentials,
   sortJsonKeys,
   mergeAdvanced,
   normalizeCustomHostname,
   resolveCommandArgv,
   resolveWorkload,
   type ComposeAdvanced,
-  type ResourceValues,
 } from "@repo/core";
 import type { Database } from "../connection";
 import { createConfigurationSecrets, type ConfigurationEncryption } from "../configuration-secrets";
+import { assertServiceSwapResources } from "./service-swap-resources";
 import { assertProjectConfigurationWritable, withProjectConfigurationWrite } from "./project-work-admission";
 import { deployment, envVar, project, service, serviceDeployment } from "../schema";
 import type { ComposeServiceSpec, ServicePublicEndpoint } from "../schema/service";
 import { liveBuildExecutionCondition } from "./deployment.repo";
+import { serviceDeploymentFinishPatch } from "./service-deployment-timing";
 
 /** A public route as it arrives on the wire (port may be a string) before
  *  normalization into a {@link ServicePublicEndpoint}. */
@@ -316,6 +318,17 @@ export function composeWritePatch(
     parsed.advanced === null ? null : (stored?.advanced ?? null),
     spec.advanced,
   );
+  // `resources` is replaced wholesale when a compose file supplies mem_limit /
+  // cpus, but `swapDisabled` is an operator-owned Docker setting with no
+  // compose equivalent. Losing it here would silently re-enable swap on the
+  // next compose sync.
+  if (
+    stored?.advanced?.resources?.swapDisabled === true &&
+    advanced.resources &&
+    advanced.resources.swapDisabled === undefined
+  ) {
+    advanced.resources = { ...advanced.resources, swapDisabled: true };
+  }
   if (usesLiteralImage) {
     // A writer that supplies an image without parser provenance means that
     // image literally. This includes manual edits AND old frozen snapshots;
@@ -388,7 +401,11 @@ export function composeWritePatch(
 const COMPOSE_OWNED_ADVANCED_KEYS = [
   "networkMode",
   "pidMode",
+  "extraHosts",
   "entrypoint",
+  "gpus",
+  "shmSize",
+  "runtime",
   "imageTemplate",
   "environmentTemplateKeys",
   "environmentOverrideKeys",
@@ -486,15 +503,16 @@ function normalizeRoutePort(port?: number | string | null): number | null {
 }
 
 /** Normalize a wire/UI public-endpoint array into stored {@link ServicePublicEndpoint}s:
- *  drop entries missing a valid port or their domain value, dedupe by port. */
+ *  drop entries missing a valid port or domain, dedupe by normalized hostname.
+ *  Distinct hostnames may share one container port. */
 export function normalizeServicePublicEndpoints(
   endpoints?: PublicEndpointInputLike[] | null,
 ): ServicePublicEndpoint[] {
   const out: ServicePublicEndpoint[] = [];
-  const seenPorts = new Set<number>();
+  const seenHostnames = new Set<string>();
   for (const endpoint of endpoints ?? []) {
     const port = normalizeRoutePort(endpoint.port);
-    if (port === null || seenPorts.has(port)) continue;
+    if (port === null) continue;
     const domainType = endpoint.domainType === "custom" ? "custom" : "free";
     const domain = domainType === "free" ? endpoint.domain?.trim() || undefined : undefined;
     const customDomain =
@@ -503,7 +521,9 @@ export function normalizeServicePublicEndpoints(
         : undefined;
     if (domainType === "free" && !domain) continue;
     if (domainType === "custom" && !customDomain) continue;
-    seenPorts.add(port);
+    const identity = `${domainType}:${(domain ?? customDomain)!.toLowerCase()}`;
+    if (seenHostnames.has(identity)) continue;
+    seenHostnames.add(identity);
     out.push({
       port,
       domainType,
@@ -609,10 +629,19 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
       inArray(project.id, db.select({ id: service.projectId }).from(service).where(eq(service.id, id))),
       data.projectId ? eq(project.id, data.projectId) : undefined,
     )!;
-    return withProjectConfigurationWrite(db, predicate, async (tx) => tx
-      .update(service)
-      .set(codec.sealService({ ...data, ...(updatedAt === null ? {} : { updatedAt }) }))
-      .where(eq(service.id, id)).returning());
+    return withProjectConfigurationWrite(db, predicate, async (tx) => {
+      if (data.advanced?.resources?.swapDisabled === true || data.projectId !== undefined) {
+        const [current] = await tx.select({ projectId: service.projectId, advanced: service.advanced })
+          .from(service).where(eq(service.id, id));
+        if (current) {
+          const advanced = data.advanced === undefined ? codec.openService(current).advanced : data.advanced;
+          await assertServiceSwapResources(tx, data.projectId ?? current.projectId, advanced?.resources);
+        }
+      }
+      return tx.update(service)
+        .set(codec.sealService({ ...data, ...(updatedAt === null ? {} : { updatedAt }) }))
+        .where(eq(service.id, id)).returning();
+    });
   }
 
   /** Both Compose writers compare decrypted values before sealing the patch.
@@ -688,7 +717,13 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
               projectId: service.projectId,
               name: service.name,
               reserved: sql<boolean>`(
-                (${service.enabled} = true AND ${project.activeDeploymentId} IS NOT NULL)
+                (${service.enabled} = true AND ${project.activeDeploymentId} IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ${serviceDeployment}
+                    WHERE ${serviceDeployment.serviceId} = ${service.id}
+                      AND ${serviceDeployment.deploymentId} = ${project.activeDeploymentId}
+                      AND ${serviceDeployment.status} = 'stopped'
+                  ))
                 OR EXISTS (
                   SELECT 1 FROM ${serviceDeployment}
                   WHERE ${serviceDeployment.serviceId} = ${service.id}
@@ -820,74 +855,15 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
       // Return the persisted defaults and timestamps. Synthesizing a Service
       // from the input omitted fields such as namespaceVolumes and made create
       // disagree with the next read of the same row.
-      const [row] = await withProjectConfigurationWrite(db, eq(project.id, data.projectId), async (tx) =>
-        tx.insert(service).values(codec.sealService({ id, ...data })).returning());
+      const [row] = await withProjectConfigurationWrite(db, eq(project.id, data.projectId), async (tx) => {
+        await assertServiceSwapResources(tx, data.projectId, data.advanced?.resources);
+        return tx.insert(service).values(codec.sealService({ id, ...data })).returning();
+      });
       return codec.openService(row!);
     },
 
     async update(id: string, data: Partial<NewService>) {
       await writeUpdate(id, data);
-    },
-
-    /** Apply a catalog's initial profiles to an unfinished app as one write set.
-     * Lock the project and services before decrypting/merging configuration so
-     * existing resource settings and concurrent edits cannot be overwritten. */
-    async seedDraftAppResourceDefaults(input: {
-      projectId: string;
-      organizationId: string;
-      appTemplateId: string;
-      profiles: readonly { name: string; resources: Readonly<ResourceValues> }[];
-    }): Promise<string[]> {
-      if (input.profiles.length === 0) return [];
-      return db.transaction(async (tx) => {
-        const [owner] = await tx
-          .select({ id: project.id })
-          .from(project)
-          .where(
-            and(
-              eq(project.id, input.projectId),
-              eq(project.organizationId, input.organizationId),
-              eq(project.appTemplateId, input.appTemplateId),
-              sql`${project.resources} IS NULL`,
-              sql`${project.activeDeploymentId} IS NULL`,
-              sql`${project.deletedAt} IS NULL`,
-              eq(project.deletionInProgress, false),
-            ),
-          )
-          .for("update");
-        if (!owner) return [];
-        const rows = await tx
-          .select()
-          .from(service)
-          .where(
-            and(
-              eq(service.projectId, owner.id),
-              inArray(
-                service.name,
-                input.profiles.map((profile) => profile.name),
-              ),
-            ),
-          )
-          .orderBy(asc(service.id))
-          .for("update");
-        const byName = new Map(rows.map((row) => [row.name, codec.openService(row)]));
-        const changed: string[] = [];
-        for (const profile of input.profiles) {
-          const row = byName.get(profile.name);
-          if (!row || row.advanced?.resources != null) continue;
-          await tx
-            .update(service)
-            .set(
-              codec.sealService({
-                advanced: { ...row.advanced, resources: { ...profile.resources } },
-                updatedAt: new Date(),
-              }),
-            )
-            .where(and(eq(service.id, row.id), eq(service.projectId, owner.id)));
-          changed.push(row.id);
-        }
-        return changed;
-      });
     },
 
     async remove(id: string) {
@@ -950,6 +926,7 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
         startCommand?: string | null;
         outputDirectory?: string | null;
         port?: number | string | null;
+        publicEndpoints?: PublicEndpointInputLike[];
         enabled?: boolean;
         exposed?: boolean;
         exposedPort?: string | null;
@@ -969,11 +946,15 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
         const ex = existingByName.get(app.name);
 
         const routing = normalizeRoutingFields({
+          publicEndpoints: app.publicEndpoints ?? ex?.publicEndpoints,
           exposed: app.exposed ?? ex?.exposed ?? true,
           exposedPort:
             app.exposedPort ?? ex?.exposedPort ?? (app.port != null ? String(app.port) : null),
-          domain: app.domain ?? ex?.domain,
-          customDomain: app.customDomain ?? ex?.customDomain,
+          domain: app.publicEndpoints !== undefined ? app.domain : (app.domain ?? ex?.domain),
+          customDomain:
+            app.publicEndpoints !== undefined
+              ? app.customDomain
+              : (app.customDomain ?? ex?.customDomain),
           domainType: app.domainType ?? ex?.domainType,
         });
 
@@ -1256,6 +1237,38 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
       });
     },
 
+    /** Start one service's unfinished build/deploy clock without changing any
+     * existing runtime or outcome fields (including pre-created carried rows). */
+    async startServiceDeploymentTiming(data: {
+      deploymentId: string;
+      serviceId: string;
+      serviceName: string;
+      startedAt?: Date;
+    }) {
+      const startedAt = data.startedAt ?? new Date();
+      await db
+        .insert(serviceDeployment)
+        .values({ id: generateId("sd"), ...data, status: "pending", startedAt })
+        .onConflictDoUpdate({
+          target: [serviceDeployment.deploymentId, serviceDeployment.serviceId],
+          set: { startedAt },
+          setWhere: sql`${serviceDeployment.startedAt} is null and ${serviceDeployment.finishedAt} is null`,
+        });
+    },
+
+    /** Settle only unfinished measured attempts when their parent stops. This
+     * records elapsed time without changing the service's runtime or outcome. */
+    async finishStartedServiceDeploymentTimings(deploymentId: string, finishedAt = new Date()) {
+      await db
+        .update(serviceDeployment)
+        .set(serviceDeploymentFinishPatch("failure", finishedAt))
+        .where(and(
+          eq(serviceDeployment.deploymentId, deploymentId),
+          sql`${serviceDeployment.startedAt} is not null`,
+          sql`${serviceDeployment.finishedAt} is null`,
+        ));
+    },
+
     /**
      * Insert-or-update a service_deployment row keyed by (deploymentId,
      * serviceId) — respects the uq_service_deployment_dep_svc unique index.
@@ -1274,6 +1287,7 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
      */
     async upsertServiceDeployment(data: Omit<NewServiceDeployment, "id">) {
       const id = generateId("sd");
+      const now = new Date();
       await db
         .insert(serviceDeployment)
         .values({ id, ...data })
@@ -1291,7 +1305,8 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
             ip: data.ip ?? null,
             reason: data.reason ?? null,
             reasonSkipped: data.reasonSkipped ?? null,
-            updatedAt: new Date(),
+            ...serviceDeploymentFinishPatch(data.status, data.finishedAt ?? now, data.finishedAt != null),
+            updatedAt: now,
           },
         });
     },
@@ -1331,16 +1346,18 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
     }) {
       const now = new Date();
       const status = data.status ?? "failure";
+      // Raw build/clone output can echo a credentialed clone URL; never persist it.
+      data = { ...data, errorMessage: redactUrlCredentials(data.errorMessage) };
 
-      const set: Partial<NewServiceDeployment> = {
+      const set = {
         serviceName: data.serviceName,
         status,
-        finishedAt: now,
+        ...serviceDeploymentFinishPatch(status, now, true),
         updatedAt: now,
+        ...(data.errorMessage !== undefined ? { errorMessage: data.errorMessage } : {}),
+        ...(data.reason !== undefined ? { reason: data.reason } : {}),
+        ...(data.imageRef ? { imageRef: data.imageRef } : {}),
       };
-      if (data.errorMessage !== undefined) set.errorMessage = data.errorMessage;
-      if (data.reason !== undefined) set.reason = data.reason;
-      if (data.imageRef) set.imageRef = data.imageRef;
 
       await db
         .insert(serviceDeployment)
@@ -1381,6 +1398,7 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
       /** Why it was skipped — see the `reason` docblock on the schema for the vocabulary. */
       reason: string;
     }) {
+      const now = new Date();
       await db
         .insert(serviceDeployment)
         .values({
@@ -1399,15 +1417,21 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
             status: "skipped",
             reason: data.reason,
             reasonSkipped: data.reason,
-            updatedAt: new Date(),
+            ...serviceDeploymentFinishPatch("skipped", now),
+            updatedAt: now,
           },
         });
     },
 
     async updateServiceDeployment(id: string, data: Partial<NewServiceDeployment>) {
+      const now = new Date();
       await db
         .update(serviceDeployment)
-        .set({ ...data, updatedAt: new Date() })
+        .set({
+          ...data,
+          ...serviceDeploymentFinishPatch(data.status, data.finishedAt ?? now, data.finishedAt != null),
+          updatedAt: now,
+        })
         .where(eq(serviceDeployment.id, id));
     },
 
@@ -1428,17 +1452,65 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
     }) {
       await db.transaction(async tx => {
         await assertProjectConfigurationWritable(tx, eq(project.id, input.projectId));
-        const [parent] = await tx.select().from(deployment).where(and(
-          eq(deployment.id, input.deploymentId),
-          eq(deployment.projectId, input.projectId),
-          eq(deployment.organizationId, input.organizationId),
-        )).for("update");
-        const [row] = await tx.select().from(serviceDeployment).where(and(
-          eq(serviceDeployment.deploymentId, input.deploymentId),
-          eq(serviceDeployment.serviceId, input.serviceId),
-        )).for("update");
-        if (!parent || !row || row.containerId !== input.expectedContainerId) {
-          throw new Error("The service changed while its environment was being applied. Try again.");
+        const [parent] = await tx
+          .select()
+          .from(deployment)
+          .where(
+            and(
+              eq(deployment.id, input.deploymentId),
+              eq(deployment.projectId, input.projectId),
+              eq(deployment.organizationId, input.organizationId),
+            ),
+          )
+          .for("update");
+        let [row] = await tx
+          .select()
+          .from(serviceDeployment)
+          .where(
+            and(
+              eq(serviceDeployment.deploymentId, input.deploymentId),
+              eq(serviceDeployment.serviceId, input.serviceId),
+            ),
+          )
+          .for("update");
+        if (!parent || (row?.containerId ?? null) !== input.expectedContainerId) {
+          throw new Error(
+            "The service changed while its environment was being applied. Try again.",
+          );
+        }
+        // Repair legacy bookkeeping only after the replacement is ready. The
+        // project lock and scoped parent/service checks keep another release or
+        // project from being adopted by this write.
+        const [owner] = await tx
+          .select({ id: project.id })
+          .from(project)
+          .where(
+            and(
+              eq(project.id, input.projectId),
+              eq(project.organizationId, input.organizationId),
+              eq(project.activeDeploymentId, input.deploymentId),
+            ),
+          );
+        const [target] = await tx
+          .select({ name: service.name })
+          .from(service)
+          .where(and(eq(service.id, input.serviceId), eq(service.projectId, input.projectId)));
+        if (!owner || !target) {
+          throw new Error(
+            "The service changed while its environment was being applied. Try again.",
+          );
+        }
+        if (!row) {
+          [row] = await tx
+            .insert(serviceDeployment)
+            .values({
+              id: generateId("sd"),
+              deploymentId: input.deploymentId,
+              serviceId: input.serviceId,
+              serviceName: target.name,
+              status: "success",
+            })
+            .returning();
         }
         const now = new Date();
         await tx.update(serviceDeployment).set({
@@ -1459,7 +1531,7 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
         const oldIds = new Set([input.expectedContainerId, input.previousContainerId]);
         const composeServices = Array.isArray(meta.composeServices)
           ? meta.composeServices.map((item: Record<string, unknown>) =>
-              item.name === row.serviceName
+              item.name === target.name
                 ? { ...item, containerId: input.containerId, ...(input.ip ? { ip: input.ip } : {}) }
                 : item)
           : undefined;

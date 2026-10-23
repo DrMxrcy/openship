@@ -32,7 +32,7 @@
  * proves the gate can still go red, since a container test that quietly stopped exercising
  * anything looks identical to a passing one.
  *
- * Config text travels in the container's own command as quoted heredocs rather than a bind
+ * Config text travels in a Docker archive as quoted heredocs rather than a bind
  * mount, for the reason the sibling edge test documents: a mount only works when the daemon
  * can see the host path, which is false for a macOS temp dir (and, measured here, for
  * `/private/tmp` under Docker Desktop) and true in CI — the one setup where a gate must not
@@ -47,7 +47,10 @@
  */
 
 import { it, expect, beforeAll, afterAll } from "vitest";
-import { readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { tmpdir } from "node:os";
 import { request as httpRequest } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -313,6 +316,11 @@ http {
   async function vhosts(): Promise<Record<string, string>> {
     const out: Record<string, string> = {};
 
+    out["canonical"] = await renderVhost({
+      domain: "www.canonical.test", tls: false, targetUrl: "http://127.0.0.1:9901",
+      redirectHost: { target: "canonical.test", statusCode: 301 },
+    } as RouteConfig);
+
     // #510 itself: a wildcard whose destination refers back to the capture.
     out["blog"] = await staticSite("blog", {
       redirects: [{ source: "/blog/:path*", destination: "/news/:path*", permanent: true }],
@@ -393,6 +401,35 @@ http {
         });
     }
 
+    // A paths-only import must never acquire an implicit catch-all. Keep the
+    // existing complete table when a retry cannot resolve one of its targets.
+    for (const backend of ["http://127.0.0.1:9904", null]) {
+      const planned = buildDomainFanoutRegistrations({
+        routes: [{
+          hostname: "pathonly.test",
+          isCustomDomain: true,
+          locations: [
+            { pathPrefix: "/v3/", serviceId: "api" },
+            { pathPrefix: "/mcp", exact: true, serviceId: "web" },
+          ],
+        }, {
+          hostname: "exactroot.test",
+          isCustomDomain: true,
+          locations: [{ pathPrefix: "/", exact: true, serviceId: "web" }],
+        }],
+        resolveTargetUrl: (id) => id === "web" ? "http://127.0.0.1:9901" : backend,
+      });
+      for (const route of planned) {
+        expect(route.notFound).toBe(true);
+        out[route.hostname] = await renderVhost({
+          domain: route.hostname,
+          tls: false,
+          notFound: true,
+          proxyLocations: route.proxyLocations,
+        });
+      }
+    }
+
     for (const host of ["rules.test", "other-rules.test", "rate.test", "other-rate.test"]) {
       out[host] = await renderVhost({
         domain: host,
@@ -430,8 +467,9 @@ http {
 
     const container = await runtime.docker.createContainer({
       Image: image,
-      Entrypoint: ["sh", "-c"],
-      Cmd: [script],
+      // Embedded Lua can exceed Linux's per-argument limit. Upload a file via
+      // the Docker API, which also works when the daemon cannot see host paths.
+      Entrypoint: ["sh", "/tmp/openship-routing-bootstrap.sh"],
       Tty: true,
       ExposedPorts: { "80/tcp": {} },
       HostConfig: {
@@ -440,6 +478,15 @@ http {
       },
     });
     started.push(container);
+    const bootstrap = await mkdtemp(join(tmpdir(), "openship-routing-bootstrap-"));
+    try {
+      await writeFile(join(bootstrap, "openship-routing-bootstrap.sh"), script);
+      const { stdout } = await promisify(execFile)("tar", ["--format=ustar", "--no-xattrs", "-cf", "-", "-C", bootstrap, "openship-routing-bootstrap.sh"],
+        { encoding: "buffer", maxBuffer: 4 * 1024 * 1024, env: { ...process.env, COPYFILE_DISABLE: "1" } });
+      await container.putArchive(stdout, { path: "/tmp" });
+    } finally {
+      await rm(bootstrap, { recursive: true, force: true });
+    }
     await container.start();
 
     const info = await container.inspect();
@@ -466,6 +513,30 @@ http {
   }
 
   // ── The rule this whole change exists for ────────────────────────────────────
+
+  it("preserves path-only upstreams after an incomplete retry and returns 404 elsewhere", async () => {
+    const api = await ask(port, "/v3/items?limit=2", "pathonly.test");
+    expect(api.status).toBe(200);
+    expect(api.body).toContain("BACKEND uri=/v3/items?limit=2");
+    const exact = await ask(port, "/mcp?request=1", "pathonly.test");
+    expect(exact.status).toBe(200);
+    expect(exact.body).toContain("APP uri=/mcp?request=1");
+    for (const path of ["/", "/private", "/v3-other", "/mcp/child"])
+      expect((await ask(port, path, "pathonly.test")).status, path).toBe(404);
+  });
+
+  it("keeps an exact root separate from a catch-all", async () => {
+    expect((await ask(port, "/?request=1", "exactroot.test")).status).toBe(200);
+    expect((await ask(port, "/anything", "exactroot.test")).status).toBe(404);
+  });
+
+  it.each([
+    "/", "/docs/a%2Fb?x=1&x=2&encoded=a%2Bb", "/hello/%E2%9C%93?q=%26&empty=&flag",
+  ])("preserves the original URL through a canonical hostname redirect: %s", async (path) => {
+    const answer = await ask(port, path, "www.canonical.test");
+    expect(answer.status).toBe(301);
+    expect(answer.location).toBe(`https://canonical.test${path}`);
+  });
 
   it("carries a wildcard capture into the redirect, with the query string", async () => {
     // The bug: served from a prefix location, `$1` expanded to empty and every visitor
@@ -587,13 +658,19 @@ http {
     expect(api.headers["x-one"]).toBe("1");
     expect(api.headers["x-two"]).toBe("2");
 
-    const dash = await ask(port, "/a-b/x", "hdrs.test");
+    const dash = await ask(port, "/a-b/", "hdrs.test");
     expect(dash.headers["x-dash"]).toBe("dash");
     expect(dash.headers["x-slash"]).toBeUndefined();
 
-    const slash = await ask(port, "/a/b/x", "hdrs.test");
+    const slash = await ask(port, "/a/b/", "hdrs.test");
     expect(slash.headers["x-slash"]).toBe("slash");
     expect(slash.headers["x-dash"]).toBeUndefined();
+
+    // Literal Vercel sources match exactly, including when a query is present.
+    // Descendants require an explicit wildcard (as used by the /api rules).
+    expect((await ask(port, "/a-b/?q=1", "hdrs.test")).headers["x-dash"]).toBe("dash");
+    expect((await ask(port, "/a-b/x", "hdrs.test")).headers["x-dash"]).toBeUndefined();
+    expect((await ask(port, "/a/b/x", "hdrs.test")).headers["x-slash"]).toBeUndefined();
 
     // Global applies everywhere; path-scoped rules are absent off their path.
     for (const path of ["/", "/api/thing", "/a-b/x"]) {

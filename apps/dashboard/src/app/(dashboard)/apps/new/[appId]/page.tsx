@@ -1,11 +1,16 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
   getAppTemplate,
+  appGpuRequirement,
+  appServiceGpuConfig,
+  appGpuEnvironment,
+  hasComposeGpuRequest,
   getAppSettings,
   getAppEndpoints,
   getAppPrepareSteps,
@@ -48,7 +53,6 @@ import {
   AppDestinationPicker,
   type AppDestination,
 } from "@/components/deploy/AppDestinationPicker";
-import { workspaceBillingHref } from "@/components/billing/BillingWorkspaceContext";
 import { RoutingSettingsCard } from "@/components/routing/RoutingSettingsCard";
 import { createPublicEndpoint, type PublicEndpoint } from "@/context/deployment/types";
 import { resolvePublicEndpointHostname } from "@/lib/public-endpoint-payload";
@@ -198,10 +202,11 @@ function rehydrateExpo(
  *  `provides` bundle ref, else the recommended (or first) connection output.
  *  Read from the BUNDLED catalog; an overlay-only source app resolves to null
  *  (the manual "Use in a project" flow remains the fallback). */
-function primaryProvidedOutputId(sourceAppTemplateId: string | undefined): string | null {
+function primaryProvidedOutputId(sourceAppTemplateId: string | undefined, bundleId?: string): string | null {
   const tpl = sourceAppTemplateId ? getAppTemplate(sourceAppTemplateId) : undefined;
   if (!tpl) return null;
-  const provRef = tpl.provides?.[0]?.outputRefs?.[0];
+  const provRef = (bundleId ? tpl.provides?.find((bundle) => bundle.id === bundleId) : tpl.provides?.[0])?.outputRefs?.[0];
+  if (bundleId) return provRef ?? null;
   if (provRef) return provRef;
   const outs = tpl.connection?.outputs ?? [];
   return (outs.find((o) => o.recommended) ?? outs[0])?.id ?? null;
@@ -269,6 +274,7 @@ export default function AppInstallPage() {
         setCatalogRead({ appId, status: "ready" });
       })
       .catch((error) => {
+        observeCaughtError(error, "dashboard/app/(dashboard)/apps/new/[appId]/page");
         if (cancelled) return;
         if (error instanceof ApiError && error.status === 404) {
           setTemplate(undefined);
@@ -331,10 +337,10 @@ export default function AppInstallPage() {
             })),
         );
       })
-      .catch(() => setCandidates([]));
+      .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/[appId]/page"); return setCandidates([]); });
   }, [requires.length]);
-  const candidatesFor = (category?: string) =>
-    candidates.filter((p) => !category || p.category === category);
+  const candidatesFor = (category?: string, bundleId?: string) =>
+    candidates.filter((p) => (!category || p.category === category) && (!bundleId || (p.appTemplateId && getAppTemplate(p.appTemplateId)?.provides?.some((bundle) => bundle.id === bundleId))));
 
   const [values, setValues] = useState<Record<string, FormValue>>(() =>
     withSettingDefaults(installFields),
@@ -365,8 +371,12 @@ export default function AppInstallPage() {
   }, [appEndpoints, cloudConnected, cloudLoading]);
   const [destination, setDestination] = useState<AppDestination | null>(null);
   const [destinationReady, setDestinationReady] = useState(false);
+  const [gpuChoice, setGpuChoice] = useState<boolean | null>(null);
+  const gpuRequirement = template ? appGpuRequirement(template) : undefined;
+  const useGpu = gpuRequirement === "required" || (gpuRequirement === "recommended" && (gpuChoice ?? destination?.hasGpu === true));
   const showCloudPricing = useCloudDeployPricing(destination?.workspaceId);
   const cloudDestination = destination?.deployTarget === "cloud" || (!destination && !selfHosted);
+  const cloudUnsupported = cloudDestination && template?.supportsCloud === false;
   const exposureModeLabels = {
     domain: { label: w.routeDomainLabel, description: w.routeDomainDesc },
     port: {
@@ -393,6 +403,7 @@ export default function AppInstallPage() {
   // a narrow viewport. Re-measured on resize for the same reason. The measurement
   // is skipped while expanded (where the two heights are equal by definition, so
   // measuring would clear the flag and remove the way back).
+  const localizedDescription = template ? ((t.library as any)?.catalog?.apps?.[template.id] || template.description) : "";
   const descRef = useRef<HTMLParagraphElement | null>(null);
   const [descExpanded, setDescExpanded] = useState(false);
   const [descClamped, setDescClamped] = useState(false);
@@ -404,7 +415,7 @@ export default function AppInstallPage() {
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [descExpanded, template?.description]);
+  }, [descExpanded, localizedDescription]);
 
   // Project name shown in Openship. Editable for a fresh install (a second
   // install of the same app auto-suffixes server-side, e.g. "Convex 2"); hidden
@@ -490,7 +501,8 @@ export default function AppInstallPage() {
       .then((res) => {
         if (live) setHostFit(res.data);
       })
-      .catch(() => {
+      .catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/[appId]/page");
         // Preview failure never substitutes for the deployment's authoritative check.
         if (live) setHostFit(null);
       })
@@ -567,7 +579,8 @@ export default function AppInstallPage() {
         const project = info?.data?.project as { slug?: string; name?: string; workspaceId?: string; serverId?: string; serverName?: string; deployTarget?: string } | undefined;
         if (!project || !Array.isArray(svcRes?.services))
           throw new Error("Incomplete draft response");
-        if (!selfHosted || project.deployTarget === "cloud" || project.workspaceId) {
+        if (template?.gpu) setGpuChoice(svcRes.services.some((service) => hasComposeGpuRequest(service.advanced)));
+        if (project.deployTarget === "cloud" || project.workspaceId) {
           setDestination({ deployTarget: "cloud", workspaceId: project.workspaceId ?? undefined, serverId: project.serverId ?? undefined, serverName: project.serverName });
         } else if (project.serverId) {
           setDestination({ deployTarget: "server", serverId: project.serverId, serverName: project.serverName });
@@ -584,7 +597,8 @@ export default function AppInstallPage() {
           slug: project.slug ?? (project.name ? slugify(project.name) : null),
         });
       })
-      .catch(() => {
+      .catch((diagnosticFailure) => {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/[appId]/page");
         if (!cancelled) setDraftRouting({ projectId: targetDraftId, status: "error" });
       });
     return () => {
@@ -601,7 +615,7 @@ export default function AppInstallPage() {
    * URL shown is the hostname that was stored, not one recomputed from intent.
    */
   const persistedRouteUrl = async (pid: string, ep: AppEndpoint): Promise<string | null> => {
-    const svcRes = await servicesApi.list(pid).catch(() => null);
+    const svcRes = await servicesApi.list(pid).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/[appId]/page"); return null; });
     const svc = ((svcRes?.services ?? []) as Service[]).find((s) => s.name === ep.service);
     const stored = svc ? storedRouteFor(svc, ep.port) : null;
     if (!stored) return null;
@@ -678,23 +692,28 @@ export default function AppInstallPage() {
       /* resume just won't survive a reload */
     }
   }, [w.installFailed, w.phaseQueued]);
-  const retryDeployment = useCallback(async function retry(): Promise<void> {
+  const resumeDeployment = useCallback(async (): Promise<void> => {
     if (!deploymentId || !projectId || submitting.current) return;
     submitting.current = true;
     setBusy(true);
     try {
       attachDeployment(await deployApi.buildRedeploy(deploymentId), projectId);
-    } catch (error) {
-      if (!showCloudPricing(error, retry)) showToast(getApiErrorMessage(error, w.installFailed), "error");
     } finally {
       submitting.current = false;
       setBusy(false);
     }
-  }, [deploymentId, projectId, attachDeployment, showCloudPricing, showToast, w.installFailed]);
+  }, [deploymentId, projectId, attachDeployment]);
+  const retryDeployment = useCallback(async (): Promise<void> => {
+    try {
+      await resumeDeployment();
+    } catch (error) {
+      if (!showCloudPricing(error, resumeDeployment)) showToast(getApiErrorMessage(error, w.installFailed), "error");
+    }
+  }, [resumeDeployment, showCloudPricing, showToast, w.installFailed]);
   useEffect(() => {
     if (phase !== "error" || !cloudFailure || !deploymentId || shownRecovery.current === deploymentId) return;
-    if (showCloudPricing(cloudFailure, retryDeployment)) shownRecovery.current = deploymentId;
-  }, [phase, cloudFailure, deploymentId, showCloudPricing, retryDeployment]);
+    if (showCloudPricing(cloudFailure, resumeDeployment)) shownRecovery.current = deploymentId;
+  }, [phase, cloudFailure, deploymentId, showCloudPricing, resumeDeployment]);
   const resolveTerminal = async (fallback: {
     ok: boolean;
     message?: string;
@@ -716,7 +735,8 @@ export default function AppInstallPage() {
       status = s.deploymentStatus ?? s.status ?? "";
       // Prefer the server's full accumulated log over the streamed fragments.
       if (typeof s.logs === "string" && s.logs.length >= logs.length) setLogs(s.logs);
-    } catch {
+    } catch (diagnosticFailure) {
+      observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/[appId]/page");
       /* fall back to the SSE outcome below */
     }
     if (activeDeployment.current !== deploymentId) return;
@@ -832,7 +852,8 @@ export default function AppInstallPage() {
           });
           return;
         }
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/[appId]/page");
         /* live deploy — attach below */
       }
       if (!cancelled) void connect(deploymentId, false);
@@ -971,12 +992,13 @@ export default function AppInstallPage() {
    *  Nothing is carried over: the wizard now asks about every DECLARED route, so a
    *  stored route for an unasked port is one no operator was ever shown. */
   const applyDraftRouting = async (pid: string, choices: InstallAppRoute[]) => {
-    if (choices.length === 0) return;
+    if (choices.length === 0 && !gpuRequirement) return;
     const svcRes = await servicesApi.list(pid);
     const services = (svcRes?.services ?? []) as Service[];
     for (const svc of services) {
       const mine = choices.filter((c) => c.service === svc.name);
-      if (mine.length === 0) continue;
+      const spec = template?.services?.find((service) => service.name === svc.name);
+      if (mine.length === 0 && !spec?.gpus) continue;
       const publicEndpoints: StoredRoute[] = mine.flatMap((c): StoredRoute[] =>
         c.mode === "custom"
           ? [{ port: c.port, domainType: "custom", customDomain: c.customDomain! }]
@@ -1001,13 +1023,18 @@ export default function AppInstallPage() {
             : [],
       );
       await servicesApi.update(pid, svc.id, {
-        ...serviceRoutingPatch({ exposed: publicEndpoints.length > 0, publicEndpoints }),
-        ports: installServicePorts(
+        ...(mine.length ? serviceRoutingPatch({ exposed: publicEndpoints.length > 0, publicEndpoints }) : {}),
+        ...(spec?.gpus ? {
+          advanced: useGpu ? appServiceGpuConfig(spec, true) : { gpus: null },
+          environment: appGpuEnvironment(spec, useGpu, svc.environment as Record<string, string>),
+        } : {}),
+        ...(mine.length ? { ports: installServicePorts(
           svc.name,
           template?.services?.find((service) => service.name === svc.name)?.ports,
           choices,
           svc.ports as string[] | null,
-        ),
+          cloudDestination ? "cloud" : "server",
+        ) } : {}),
       });
     }
   };
@@ -1164,7 +1191,7 @@ export default function AppInstallPage() {
   };
 
   const install = withSubmission(async () => {
-    if (!destinationReady) return;
+    if (!destinationReady || cloudUnsupported) return;
     // Business-field validity gate (required + per-field rules). The form reports
     // this; block with a clear message rather than shipping an invalid install.
     if (formValidity && !formValidity.valid) {
@@ -1226,14 +1253,27 @@ export default function AppInstallPage() {
     // failure rejects buildAccess BEFORE that, so `started` stays false and the
     // catch surfaces a toast instead of the full-screen error card.
     let started = false;
-    try {
+    let pid = adoptedProjectId ?? projectId;
+    const startDeploy = async (targetPid: string) => {
+      const dep = await deployApi.buildAccess({
+        projectId: targetPid,
+        serviceDeploymentMode: "services",
+        deployTarget: destination?.deployTarget,
+        serverId: destination?.serverId,
+      });
+      attachDeployment(dep, targetPid);
+      started = true;
+    };
+    // Keep the confirmed routes, configuration and created project in this
+    // continuation. Checkout never remounts the form or creates a second draft.
+    const prepareAndDeploy = async () => {
       // Reuse an adopted / already-created draft; only create when we have none.
       // A fresh install carries the routing IN the create write (one atomic write
       // per service); an existing draft has no create write, so it's re-applied.
-      let pid = adoptedProjectId ?? projectId;
       if (!pid) {
         const res = await appsApi.install({
           templateId: appId,
+          ...(gpuRequirement ? { useGpu } : {}),
           serverId: destination?.serverId,
           name: appName.trim() || undefined,
           routes,
@@ -1260,7 +1300,7 @@ export default function AppInstallPage() {
         const src = connChoices[req.id];
         if (!src) continue;
         const cand = candidates.find((p) => p.id === src);
-        const outputId = primaryProvidedOutputId(cand?.appTemplateId);
+        const outputId = primaryProvidedOutputId(cand?.appTemplateId, req.bundleId);
         if (!outputId) continue;
         try {
           await connectionsApi.bundle(pid, {
@@ -1273,39 +1313,12 @@ export default function AppInstallPage() {
         }
       }
 
-      const startDeploy = async (targetPid: string) => {
-        try {
-          const dep = await deployApi.buildAccess({
-            projectId: targetPid,
-            serviceDeploymentMode: "services",
-            // Where to install — reuses the deploy wizard's target selection.
-            // Undefined falls back to the project/meta default server-side.
-            deployTarget: destination?.deployTarget,
-            serverId: destination?.serverId,
-          });
-          attachDeployment(dep, targetPid);
-          started = true;
-        } catch (err) {
-          if (!started && showCloudPricing(err, () => startDeploy(targetPid))) return;
-          const msg = getApiErrorMessage(err, w.installFailed).replace(
-            /^Pre-deploy checks failed:\s*/i,
-            "",
-          );
-          if (started) {
-            setErrorMsg(msg);
-            setPhase("error");
-          } else {
-            showToast(msg, "error");
-          }
-        }
-      };
-
       // Pre-deploy DNS gate (custom domains): surface the records to add
       // or auto-configure BEFORE the deploy so DNS is pointed when the first-deploy
       // SSL attempt runs.
       const pendingDnsTargets = appInstallDnsTargets(routes ?? []);
       if (pendingDnsTargets.length > 0) {
-        const projectInfo = await projectsApi.getInfo(pid).catch(() => null);
+        const projectInfo = await projectsApi.getInfo(pid).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "dashboard/app/(dashboard)/apps/new/[appId]/page"); return null; });
         const domainRows = Array.isArray(projectInfo?.data?.project?.domains)
           ? projectInfo.data.project.domains
           : [];
@@ -1327,9 +1340,17 @@ export default function AppInstallPage() {
         }
       }
 
-      await startDeploy(pid);
+      const targetPid = pid;
+      retryAction = () => startDeploy(targetPid);
+      await retryAction();
+    };
+    let retryAction = prepareAndDeploy;
+    try {
+      await prepareAndDeploy();
     } catch (err) {
-      if (!started && showCloudPricing(err)) return;
+      // Retry failures must reject to the recovery modal instead of being
+      // swallowed as success, so a still-blocked deployment stays recoverable.
+      if (!started && showCloudPricing(err, withSubmission(() => retryAction()))) return;
       // Strip the server's "Pre-deploy checks failed:" prefix for a cleaner
       // message. Nothing deployed yet → toast + stay on the form; a deploy that
       // already started keeps the log-bearing error card (with build details).
@@ -1351,7 +1372,7 @@ export default function AppInstallPage() {
    *  picked so far travels with the create write — the /deploy wizard then edits
    *  real stored routes instead of ones the server guessed. */
   const goAdvanced = withSubmission(async () => {
-    if (!destinationReady) return;
+    if (!destinationReady || cloudUnsupported) return;
     const routes = await validatedRouteChoices();
     if (!routes) return;
     try {
@@ -1363,6 +1384,7 @@ export default function AppInstallPage() {
       }
       const res = await appsApi.install({
         templateId: appId,
+        ...(gpuRequirement ? { useGpu } : {}),
         serverId: destination?.serverId,
         name: appName.trim() || undefined,
         routes,
@@ -1510,7 +1532,7 @@ export default function AppInstallPage() {
       <CleanDeployProgressCard
         appId={appId}
         title={template.name}
-        description={template.description}
+        description={localizedDescription}
         phase={phase}
         progress={progress}
         phaseLabel={phaseLabel}
@@ -1540,7 +1562,7 @@ export default function AppInstallPage() {
         recoveryAction={cloudFailure ? {
           label: cloudFailure.status === 409 ? t.billing.capacityEditor.title : t.billing.deployGate.manageBilling,
           pending: busy,
-          onClick: () => { showCloudPricing(cloudFailure, retryDeployment); },
+          onClick: () => { showCloudPricing(cloudFailure, resumeDeployment); },
         } : undefined}
         onStop={stopInstall}
         isStopping={isStopping}
@@ -1616,7 +1638,7 @@ export default function AppInstallPage() {
               ref={descRef}
               className={`text-sm text-muted-foreground ${descExpanded ? "" : "line-clamp-2"}`}
             >
-              {template.description}
+              {localizedDescription}
             </p>
             {(descClamped || descExpanded) && (
               <button
@@ -1677,27 +1699,26 @@ export default function AppInstallPage() {
                 </p>
                 <div className="mt-4 space-y-4">
                   {requires.map((req) => {
-                    const opts = candidatesFor(req.category);
+                    const opts = candidatesFor(req.category, req.bundleId);
                     return (
                       <div key={req.id}>
                         <label className="text-sm font-medium text-foreground">
                           {resolveLocalized(req.label, locale)}
                           {!req.optional && <span className="ms-0.5 text-danger">*</span>}
                         </label>
-                        <select
-                          className="mt-2 w-full rounded-xl border border-border/50 bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/25"
+                        <CustomSelect
+                          aria-label={resolveLocalized(req.label, locale)}
+                          className="mt-2"
                           value={connChoices[req.id] ?? ""}
-                          onChange={(e) =>
-                            setConnChoices((p) => ({ ...p, [req.id]: e.target.value }))
+                          onChange={(value) =>
+                            setConnChoices((p) => ({ ...p, [req.id]: value }))
                           }
-                        >
-                          <option value="">{req.optional ? "None" : "Select an app…"}</option>
-                          {opts.map((p) => (
-                            <option key={p.id} value={p.id}>
-                              {p.name}
-                            </option>
-                          ))}
-                        </select>
+                          options={[
+                            { value: "", label: req.optional ? "None" : "Select an app…" },
+                            ...opts.map((p) => ({ value: p.id, label: p.name })),
+                          ]}
+                          disabled={busy}
+                        />
                         {opts.length === 0 && (
                           <p className="mt-1.5 text-xs text-warning">
                             No matching app installed yet — install one first, then connect.
@@ -1866,6 +1887,8 @@ export default function AppInstallPage() {
 
               <div className="mt-4">
                 <AppDestinationPicker
+                  needsGpu={useGpu}
+                  selfHostedOnly={template.supportsCloud === false}
                   value={destination}
                   onChange={setDestination}
                   onReadyChange={setDestinationReady}
@@ -1874,6 +1897,23 @@ export default function AppInstallPage() {
                   disabledReason={targetDraftId || projectId ? t.billing.workspaces.savedDestinationHint : undefined}
                 />
               </div>
+
+              {gpuRequirement && <div className="mt-4 space-y-2">
+                <p className="text-sm font-medium">{t.dashboard.pages.apps.gpu.mode}</p>
+                {gpuRequirement === "recommended" ? <CustomSelect
+                  aria-label={t.dashboard.pages.apps.gpu.mode}
+                  value={useGpu ? "nvidia" : "cpu"}
+                  onChange={(value) => setGpuChoice(value === "nvidia")}
+                  options={[
+                    { value: "cpu", label: t.dashboard.pages.apps.gpu.cpu },
+                    { value: "nvidia", label: t.dashboard.pages.apps.gpu.nvidia },
+                  ]}
+                  disabled={busy}
+                /> : <p className="text-sm">{t.dashboard.pages.apps.gpu.required}</p>}
+                {useGpu && <p className="text-xs leading-relaxed text-muted-foreground">{t.dashboard.pages.apps.gpu.hint}</p>}
+                {useGpu && destination?.hasGpu === false && !cloudDestination && <p className="text-xs text-warning">{t.dashboard.pages.apps.gpu.noGpu}</p>}
+              </div>}
+              {cloudUnsupported && <p role="status" className="mt-4 text-sm text-warning">{t.dashboard.pages.apps.gpu.cloudUnsupported}</p>}
 
               {/* Declared minimum vs. the destination's measured capacity. Shown
                   only on a real shortfall — an unmeasurable box reports "unknown",
@@ -1935,41 +1975,30 @@ export default function AppInstallPage() {
             {/* Actions */}
             <div className="space-y-2">
               {configurationNotice}
-              {needsCloudUpgrade ? (
-                <a
-                  href={workspaceBillingHref("/billing/plans", destination?.workspaceId)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-5 py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-primary"
-                >
-                  {w.upgradePlan}
-                  <UiIcon name="arrow-up-right" className="size-4" />
-                </a>
-              ) : (
-                <button
-                  type="button"
-                  onClick={install}
-                  disabled={
-                    busy ||
-                    !destinationReady ||
-                    checkingCloudCapacity ||
-                    !exposureReady ||
-                    (formValidity ? !formValidity.valid : false)
-                  }
-                  className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-5 py-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {busy ? (
-                    <UiIcon name="spinner" className="size-4 animate-spin" />
-                  ) : (
-                    <UiIcon name="arrow-right" className="size-4 rtl:rotate-180" />
-                  )}
-                  {checkingCloudCapacity ? w.checkingCapacity : w.install}
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={install}
+                disabled={
+                  busy ||
+                  !destinationReady ||
+                  cloudUnsupported ||
+                  checkingCloudCapacity ||
+                  !exposureReady ||
+                  (formValidity ? !formValidity.valid : false)
+                }
+                className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-5 py-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {busy ? (
+                  <UiIcon name="spinner" className="size-4 animate-spin" />
+                ) : (
+                  <UiIcon name="arrow-right" className="size-4 rtl:rotate-180" />
+                )}
+                {checkingCloudCapacity ? w.checkingCapacity : needsCloudUpgrade ? w.upgradePlan : w.install}
+              </button>
               <button
                 type="button"
                 onClick={goAdvanced}
-                disabled={busy || !exposureReady || !destinationReady}
+                disabled={busy || !exposureReady || !destinationReady || cloudUnsupported}
                 className="inline-flex w-full items-center justify-center gap-2 rounded-xl py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
               >
                 <UiIcon name="sliders" className="size-4" /> {w.advanced}

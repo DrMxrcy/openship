@@ -1,5 +1,6 @@
 "use client";
 
+import { observedAllSettled, reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
@@ -9,6 +10,7 @@ import { usePlatform } from "@/context/PlatformContext";
 import { serviceKind, serviceCanStartWithoutBuild, servicesApi, sortServicesByPublicFirst, type Service, type ServiceContainer, type ServiceInput } from "@/lib/api/services";
 import { getServiceStatus } from "@/components/services/ServiceStatusBadge";
 import { Button } from "@/components/ui/button";
+import { ConnectionNotice } from "@/components/shared/ConnectionNotice";
 import { getApiErrorMessage, isAbortError } from "@/lib/api/client";
 import { useToast } from "@/context/ToastContext";
 import { serviceDisplayUrl } from "@/utils/route-display";
@@ -16,10 +18,13 @@ import { useRouter } from "next/navigation";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 
 import { ServiceDetailPanel } from "./services/ServiceDetailPanel";
+import { useCloudDeployPricing } from "@/hooks/useCloudDeployPricing";
 import { AddServiceModal } from "./services/AddServiceModal";
 import { LinkedAppsCard } from "./services/LinkedAppsCard";
 import { ServiceListItem } from "./services/ServiceListItem";
 import { hasSeparateApplication } from "@/lib/project-application";
+import { RuntimeRoleConfigurationControl } from "@/components/services/RuntimeRoleConfiguration";
+import { RuntimeRolesCard } from "@/components/services/RuntimeRoles";
 import { ProjectApplicationCard } from "./services/ProjectApplicationCard";
 
 /** Render a drift diff value (arrays → csv, objects → keys, scalars → string). */
@@ -41,6 +46,7 @@ export const ServicesTab = () => {
   const { showToast } = useToast();
   const { t } = useI18n();
   const router = useRouter();
+  const showCloudPricing = useCloudDeployPricing(projectData.workspaceId);
 
   const [runtime, setRuntime] = useState<{
     projectId: string;
@@ -90,10 +96,10 @@ export const ServicesTab = () => {
       // surfaces as a bare runtime error overlay instead of this component's
       // error state. The container read is also the one that can time out
       // (it reflects live runtime state), so it must not take the tab down.
-      const [, containersResult] = await Promise.allSettled([
+      const [, containersResult] = await observedAllSettled([
         refreshServices(),
         servicesApi.containers(id),
-      ]);
+      ], "dashboard/app/(dashboard)/projects/[id]/components/ServicesTab");
       if (request !== runtimeRequest.current) return;
       if (containersResult.status === "rejected") throw containersResult.reason;
       const ctRes = containersResult.value;
@@ -105,15 +111,20 @@ export const ServicesTab = () => {
         error: null,
       });
     } catch (e) {
+      observeCaughtError(e, "dashboard/app/(dashboard)/projects/[id]/components/ServicesTab");
       if (request !== runtimeRequest.current) return;
       // An aborted request's message is "signal is aborted without reason" —
       // useless to a user, so fall back to the generic copy for it.
-      setRuntime({
+      setRuntime((previous) => ({
         projectId: id,
-        containers: null,
+        // Keep identity/port details, but never present a stale health reading
+        // as current after a failed request.
+        containers: previous.projectId === id
+          ? previous.containers?.map((container) => ({ ...container, status: "unknown" })) ?? null
+          : null,
         loading: false,
         error: !isAbortError(e) && e instanceof Error ? e.message : t.projects.services.failedLoad,
-      });
+      }));
     }
   }, [hasProjectId, id, refreshServices, t.projects.services.failedLoad]);
 
@@ -145,7 +156,10 @@ export const ServicesTab = () => {
   const handleCreateService = async (data: ServiceInput) => {
     if (!hasProjectId) return;
 
-    const result = await servicesApi.create(id, data);
+    const result = await servicesApi.create(id, data).catch(error => {
+      showCloudPricing(error);
+      throw error;
+    });
     if (!result.success) {
       throw new Error(t.projects.services.failedCreateService);
     }
@@ -190,6 +204,12 @@ export const ServicesTab = () => {
         router.push(`/projects/${id}/services/${newServiceId}`);
       })
       .catch(async (err) => {
+        if (showCloudPricing(err, async () => {
+          const result = await servicesApi.start(id, newServiceId);
+          if (result?.success === false) throw new Error(t.projects.services.toastDeployFailed);
+          await fetchData();
+          router.push(`/projects/${id}/services/${newServiceId}`);
+        })) { await fetchData(); return; }
         await showStartFailure(getApiErrorMessage(err, t.projects.services.toastDeployFailed));
       });
   };
@@ -213,6 +233,7 @@ export const ServicesTab = () => {
         );
         await fetchData();
       } catch (e) {
+        observeCaughtError(e, "dashboard/app/(dashboard)/projects/[id]/components/ServicesTab");
         showToast(e instanceof Error ? e.message : t.projects.services.failedResolveDrift, "error", name);
       } finally {
         setDriftBusy(null);
@@ -406,28 +427,30 @@ export const ServicesTab = () => {
     );
   }
 
-  const errorNotice = failure && (
-    <div className="flex items-center gap-2 rounded-xl border border-danger/30 bg-danger/[0.06] px-3 py-2 text-xs text-danger">
-      <UiIcon name="alert-circle" className="size-3.5 shrink-0" />
-      <span className="min-w-0 flex-1">{failure}</span>
-      <button onClick={fetchData} className="font-medium underline underline-offset-2">
-        {t.projects.services.retry}
-      </button>
-    </div>
+  const statusUnavailable = services.some((service) => getServiceStatus(service, containerFor(service.id), containersLoading) === "unknown");
+  const errorNotice = (failure || statusUnavailable) && (
+    <ConnectionNotice
+      title={t.projectDetail.services.connection.statusTitle}
+      message={t.projectDetail.services.connection.statusHint}
+      detail={failure || undefined}
+      onRetry={fetchData}
+      retrying={containersLoading}
+    />
   );
 
   /* ── Service list + detail panel ───────────────────────────────── */
   if (selectedService) {
     return (
       <div className="space-y-4">
-        {errorNotice}
+        {servicesData.error && errorNotice}
         <ServiceDetailPanel
-          // Key by service id so switching services (via the header switcher)
+          // Key by project/service so switching services (via the header switcher)
           // remounts on the tab carried in the URL, with per-service state fresh.
-          key={selectedService.id}
+          key={`${id}:${selectedService.id}`}
           service={selectedService}
           container={containerFor(selectedService.id)}
           containerChecking={containersLoading}
+          containerError={error}
           projectId={id}
           workspaceId={projectData.workspaceId}
           projectSlugBase={projectSlugBase}
@@ -455,7 +478,11 @@ export const ServicesTab = () => {
             { count: String(services.length) },
           )}
         </h2>
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {!hasApplication && projectData.activeDeploymentId && projectData.runtimeMode === "docker" &&
+            projectData.deployTarget !== "cloud" && !projectData.clusterId && (
+            <RuntimeRoleConfigurationControl projectId={id} deploymentId={projectData.activeDeploymentId} />
+          )}
           <Button asChild variant="ghost" size="sm">
             <Link href={`/projects/${id}/topology`}>
               <UiIcon name="network" />
@@ -480,6 +507,8 @@ export const ServicesTab = () => {
           </Button>
         </div>
       </div>
+
+      {!hasApplication && <RuntimeRolesCard projectId={id} deploymentId={projectData.activeDeploymentId} />}
 
       {/* Upstream compose drift — edited services whose repo values changed */}
       {driftedServices.length > 0 && (

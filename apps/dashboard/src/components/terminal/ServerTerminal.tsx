@@ -1,5 +1,6 @@
 "use client";
 
+import { reportCaughtError as observeCaughtError } from "@repo/core/diagnostics";
 import { Icon as UiIcon } from "@repo/ui/icons";
 
 /**
@@ -31,6 +32,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { readTerminalTheme as themeFor, observeTerminalAppearance } from "@/lib/terminal-appearance";
 import { usePtyConnection } from "@/hooks/usePtyConnection";
 import { Button } from "@/components/ui/button";
 import type { TerminalErrorCode } from "@/lib/api";
@@ -76,58 +78,6 @@ interface ServerTerminalProps {
   /** Optional theme override; defaults to dark. */
   theme?: TerminalTheme;
   className?: string;
-}
-
-const darkTheme = {
-  background: "#0a0a0a",
-  foreground: "#e5e5e5",
-  cursor: "#ffffff",
-  cursorAccent: "#0a0a0a",
-  selectionBackground: "#3a3a3a",
-  black: "#000000",
-  red: "#cd3131",
-  green: "#0dbc79",
-  yellow: "#e5e510",
-  blue: "#2472c8",
-  magenta: "#bc3fbc",
-  cyan: "#11a8cd",
-  white: "#e5e5e5",
-  brightBlack: "#666666",
-  brightRed: "#f14c4c",
-  brightGreen: "#23d18b",
-  brightYellow: "#f5f543",
-  brightBlue: "#3b8eea",
-  brightMagenta: "#d670d6",
-  brightCyan: "#29b8db",
-  brightWhite: "#e5e5e5",
-};
-
-const lightTheme = {
-  background: "#ffffff",
-  foreground: "#1a1a1a",
-  cursor: "#000000",
-  cursorAccent: "#ffffff",
-  selectionBackground: "#d1d5da",
-  black: "#1a1a1a",
-  red: "#d73a49",
-  green: "#22863a",
-  yellow: "#b08800",
-  blue: "#0366d6",
-  magenta: "#6f42c1",
-  cyan: "#1b7c83",
-  white: "#6a737d",
-  brightBlack: "#959da5",
-  brightRed: "#cb2431",
-  brightGreen: "#22863a",
-  brightYellow: "#dbab09",
-  brightBlue: "#0366d6",
-  brightMagenta: "#6f42c1",
-  brightCyan: "#1b7c83",
-  brightWhite: "#1a1a1a",
-};
-
-function themeFor(mode: TerminalTheme) {
-  return mode === "light" ? lightTheme : darkTheme;
 }
 
 function humanizeError(code: TerminalErrorCode | string): string {
@@ -252,7 +202,7 @@ export const ServerTerminal = forwardRef<ServerTerminalHandle, ServerTerminalPro
         fontFamily: '"JetBrains Mono", "Fira Code", Menlo, Consolas, monospace',
         fontSize: 13,
         lineHeight: 1.15,
-        theme: themeFor(theme),
+        theme: themeFor(containerRef.current),
         cursorBlink: true,
         scrollback: 5000,
         allowProposedApi: true,
@@ -274,12 +224,21 @@ export const ServerTerminal = forwardRef<ServerTerminalHandle, ServerTerminalPro
         if (!cancelled) {
           const webgl = new WebglAddon();
           webgl.onContextLoss(() => {
-            try { webgl.dispose(); } catch { /* already gone → DOM renderer */ }
+            try { webgl.dispose(); } catch (diagnosticFailure) {
+              observeCaughtError(diagnosticFailure, "dashboard/components/terminal/ServerTerminal"); /* already gone → DOM renderer */ }
           });
           terminal.loadAddon(webgl);
         }
-      } catch {
+      } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "dashboard/components/terminal/ServerTerminal");
         /* WebGL not available → default DOM renderer, still fully works */
+      }
+
+      // Unmounted while the WebGL addon loaded: the effect cleanup already
+      // ran, so nothing would dispose this terminal later.
+      if (cancelled || !containerRef.current) {
+        terminal.dispose();
+        return;
       }
 
       xtermRef.current = terminal;
@@ -302,7 +261,8 @@ export const ServerTerminal = forwardRef<ServerTerminalHandle, ServerTerminalPro
         selectionTimer = setTimeout(() => {
           const sel = terminal.getSelection();
           if (!sel) return;
-          try { void navigator.clipboard?.writeText?.(sel); } catch { /* no perms */ }
+          try { void navigator.clipboard?.writeText?.(sel); } catch (diagnosticFailure) {
+            observeCaughtError(diagnosticFailure, "dashboard/components/terminal/ServerTerminal"); /* no perms */ }
         }, 150);
       });
 
@@ -314,7 +274,8 @@ export const ServerTerminal = forwardRef<ServerTerminalHandle, ServerTerminalPro
         if (!visibleRef.current) return;
         const el = containerRef.current;
         if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
-        try { fitAddon.fit(); } catch { /* container not yet sized */ }
+        try { fitAddon.fit(); } catch (diagnosticFailure) {
+          observeCaughtError(diagnosticFailure, "dashboard/components/terminal/ServerTerminal"); /* container not yet sized */ }
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
           const cols = terminal.cols;
@@ -327,15 +288,18 @@ export const ServerTerminal = forwardRef<ServerTerminalHandle, ServerTerminalPro
       const ro = new ResizeObserver(fit);
       ro.observe(containerRef.current);
       window.addEventListener("resize", fit);
+      const stopAppearance = observeTerminalAppearance(terminal, containerRef.current, fit);
 
       setTerminalReady(true);
 
       cleanup = () => {
         ro.disconnect();
         window.removeEventListener("resize", fit);
+        stopAppearance();
         if (resizeTimer) clearTimeout(resizeTimer);
         if (selectionTimer) clearTimeout(selectionTimer);
-        try { terminal.dispose(); } catch { /* already disposed */ }
+        try { terminal.dispose(); } catch (diagnosticFailure) {
+          observeCaughtError(diagnosticFailure, "dashboard/components/terminal/ServerTerminal"); /* already disposed */ }
         if (xtermRef.current === terminal) {
           xtermRef.current = null;
           fitAddonRef.current = null;
@@ -377,11 +341,13 @@ export const ServerTerminal = forwardRef<ServerTerminalHandle, ServerTerminalPro
     const t = window.setTimeout(() => {
       const el = containerRef.current;
       if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
-      try { fitAddon.fit(); } catch { /* not sized yet */ }
+      try { fitAddon.fit(); } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "dashboard/components/terminal/ServerTerminal"); /* not sized yet */ }
       if (xterm.cols && xterm.rows) {
         ptyRef.current.sendResize(xterm.cols, xterm.rows);
       }
-      try { xterm.focus(); } catch { /* not focusable */ }
+      try { xterm.focus(); } catch (diagnosticFailure) {
+        observeCaughtError(diagnosticFailure, "dashboard/components/terminal/ServerTerminal"); /* not focusable */ }
     }, 30);
     return () => window.clearTimeout(t);
   }, [visible]);
@@ -389,7 +355,7 @@ export const ServerTerminal = forwardRef<ServerTerminalHandle, ServerTerminalPro
   // Apply theme changes after mount.
   useEffect(() => {
     const xterm = xtermRef.current;
-    if (xterm) xterm.options.theme = themeFor(theme);
+    if (xterm) xterm.options.theme = themeFor(containerRef.current);
   }, [theme]);
 
   // ── Status banner ───────────────────────────────────────────────────────

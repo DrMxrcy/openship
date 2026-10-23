@@ -38,12 +38,14 @@
  * `commit_sha_before`.
  */
 
+import { reportCaughtError as observeCaughtError, diagnostics as errorDiagnostics } from "@repo/core/diagnostics";
 import { findActiveDeployment } from "@repo/platform/engine/lib/active-deployment";
 import { repos, type Deployment, type Project } from "@repo/db";
-import { BareRuntime, DockerRuntime, sharedMountExecutor, type DeploymentRef, type ResourceConfig } from "@repo/adapters";
-import { AppError, safeErrorMessage } from "@repo/core";
+import { BareRuntime, DockerRuntime, ownsBuiltImage, sharedMountExecutor, type DeploymentRef, type ResourceConfig, type RuntimeAdapter } from "@repo/adapters";
+import { AppError, safeErrorMessage, withTimeout } from "@repo/core";
 import { isArtifactRef, usableRef } from "../../../lib/container-ref";
-import { resolveDeploymentRuntime } from "../../../lib/deployment-runtime";
+import { acquireLocalHostExecutor, resolveDeploymentRuntime, resolveDeploymentRuntimeForRead } from "../../../lib/deployment-runtime";
+import { LOCAL_HOST_PORT_TARGET } from "../../../lib/host-port-target";
 import { withProjectRuntimeLock } from "../../../lib/project-runtime-lock";
 import {
   checkNoActiveBuild,
@@ -53,7 +55,10 @@ import {
 import { buildBackgroundContext } from "../../../lib/background-context";
 import { retainedArtifacts, effectiveServiceArtifacts } from "../retained-artifacts";
 import { withRetentionLock } from "../retention-lock";
+import { reclaimAutomaticRollbackArtifacts } from "../automatic-retention";
+import { getHostDisk } from "../../../lib/host-disk";
 import { withoutPinnedArtifacts } from "../pinned-artifacts";
+import { roleTeardownTimeoutMs } from "../role-runtime";
 import {
   planRestore,
   planNeedsRepository,
@@ -99,7 +104,7 @@ async function onDeploymentReadyUnlocked(opts: {
   previousActive: Deployment | null;
 }): Promise<void> {
   const { newDeployment, previousActive } = opts;
-  const project = await repos.project.findById(newDeployment.projectId).catch(() => null);
+  const project = await repos.project.findById(newDeployment.projectId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/rollback/rollback-orchestrator"); return null; });
   if (!project || project.deletionInProgress || project.activeDeploymentId !== newDeployment.id) return;
 
   if (previousActive && previousActive.id !== newDeployment.id) {
@@ -119,7 +124,7 @@ async function onDeploymentReadyUnlocked(opts: {
       }
       await repos.deployment.setArtifactRetainedAt(previousActive.id, new Date());
     } catch (err) {
-      console.error(
+      errorDiagnostics.error("platform/engine/modules/deployments/rollback/rollback-orchestrator",
         `[rollback-orchestrator] Failed to retain previous deployment ${previousActive.id}:`,
         err,
       );
@@ -130,7 +135,7 @@ async function onDeploymentReadyUnlocked(opts: {
   // what makes the dashboard's rollback affordance honest for EVERY project,
   // not only those that opted into artifact retention.
   await repos.deployment.setArtifactRetainedAt(newDeployment.id, new Date()).catch((err) => {
-    console.error(`[rollback-orchestrator] Failed to mark ${newDeployment.id} retained:`, err);
+    errorDiagnostics.error("platform/engine/modules/deployments/rollback/rollback-orchestrator", `[rollback-orchestrator] Failed to mark ${newDeployment.id} retained:`, err);
   });
 
   try {
@@ -138,7 +143,7 @@ async function onDeploymentReadyUnlocked(opts: {
     // same hook also serves callers that have already completed their worker.
     await reconcileProjectRetention(newDeployment.projectId);
   } catch (err) {
-    console.error(
+    errorDiagnostics.error("platform/engine/modules/deployments/rollback/rollback-orchestrator",
       `[rollback-orchestrator] Prune failed for project ${newDeployment.projectId}:`,
       err,
     );
@@ -188,7 +193,7 @@ export async function resolveRestorePlan(targetDeploymentId: string): Promise<{
       }
       if (runtime instanceof DockerRuntime) {
         for (const ref of candidates) {
-          presence.set(ref, await runtime.imageExistsLocally(ref).catch(() => false));
+          presence.set(ref, await runtime.imageExistsLocally(ref).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/rollback/rollback-orchestrator"); return false; }));
         }
       }
       if (staticDir) {
@@ -205,8 +210,8 @@ export async function resolveRestorePlan(targetDeploymentId: string): Promise<{
     // Host unreachable / server row gone: we can't prove an artifact is there, so
     // plan a safe non-retained recovery rather than promising an instant restore.
     unitRestore = false;
-    console.warn(
-      `[rollback] Could not inspect the host for ${target.id}; planning artifact recovery: ${safeErrorMessage(err)}`,
+    errorDiagnostics.warn("platform/engine/modules/deployments/rollback/rollback-orchestrator",
+      `[rollback] Could not inspect the host for ${target.id}; planning artifact recovery: ${safeErrorMessage(err)}`, err,
     );
   }
 
@@ -329,7 +334,7 @@ async function restoreViaRedeploy(
   // triggerer is the system.
   const orgMembers = await repos.member
     .listByOrganization(target.organizationId)
-    .catch(() => [] as Array<{ userId: string }>);
+    .catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/rollback/rollback-orchestrator"); return [] as Array<{ userId: string }>; });
   const rollbackCtx = buildBackgroundContext({
     userId: orgMembers[0]?.userId ?? "",
     organizationId: target.organizationId,
@@ -450,7 +455,7 @@ async function restoreViaUnitSwap(
       // restorable previous version.
       await repos.project.setActiveDeployment(target.projectId, target.id);
     } catch (dbErr) {
-      console.error(
+      errorDiagnostics.error("platform/engine/modules/deployments/rollback/rollback-orchestrator",
         `[rollback] DB write failed after unit swap of ${target.id}; swapping back:`,
         dbErr,
       );
@@ -471,7 +476,7 @@ async function restoreViaUnitSwap(
       await syncProjectManagedEdge(refreshed, target.organizationId, { markOnFailure: true });
     }
   } catch (err) {
-    console.warn(`[rollback] Managed edge sync after restore of ${target.id} failed:`, err);
+    errorDiagnostics.warn("platform/engine/modules/deployments/rollback/rollback-orchestrator", `[rollback] Managed edge sync after restore of ${target.id} failed:`, err);
   }
 }
 
@@ -484,7 +489,7 @@ async function probeRunning(
   intervalMs = 1_000,
 ): Promise<boolean> {
   for (let i = 0; i < attempts; i += 1) {
-    const info = await runtime.getContainerInfo(containerId).catch(() => null);
+    const info = await runtime.getContainerInfo(containerId).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/deployments/rollback/rollback-orchestrator"); return null; });
     if (info?.status === "running") return true;
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, intervalMs));
   }
@@ -515,7 +520,7 @@ async function revertUnitSwap(
       await runtime.archive({ ...toRef(target), containerId: liveContainerId });
     }
   } catch (err) {
-    console.error(
+    errorDiagnostics.error("platform/engine/modules/deployments/rollback/rollback-orchestrator",
       `[rollback] CRITICAL: could not restore the previous release after a failed swap of ${target.id}. ` +
         `The runtime may be serving ${liveContainerId ?? "nothing"} while the DB records ${currentActive?.id ?? "no active release"}. Manual reconciliation required.`,
       err,
@@ -533,8 +538,12 @@ export async function prune(projectId: string): Promise<{ purged: number; failed
   return await withRetentionLock(projectId, pruneUnlocked) ?? { purged: 0, failed: 0 };
 }
 
-async function pruneUnlocked(project: Project): Promise<{ purged: number; failed: number }> {
-  const keep = await retainedArtifacts(project);
+async function pruneUnlocked(
+  project: Project,
+  keep?: Awaited<ReturnType<typeof retainedArtifacts>>,
+  runtimeOverride?: RuntimeAdapter,
+): Promise<{ purged: number; failed: number }> {
+  keep ??= await retainedArtifacts(project);
   let purged = 0;
   let failed = 0;
   for (const dep of keep.overflow) {
@@ -542,8 +551,33 @@ async function pruneUnlocked(project: Project): Promise<{ purged: number; failed
       // Read the complete inventory before any deletion. Losing the query must
       // never look like a release without services and clear its retry marker.
       const serviceRows = await effectiveServiceArtifacts(dep, await repos.service.listByDeployment(dep.id));
-      const { runtime } = await resolveDeploymentRuntime(dep);
+      const runtime = runtimeOverride ?? (await resolveDeploymentRuntime(dep)).runtime;
       try {
+        // Roles share the release image. Remove them before purging that image,
+        // while respecting references from every release in the keep set.
+        const roleContainers = new Set(
+          (dep.roleContainers ?? [])
+            .map((role) => usableRef(role.containerId))
+            .filter((id): id is string => !!id && !keep.containers.has(id)),
+        );
+        const roleTimeoutMs = roleTeardownTimeoutMs((dep.meta as DeploymentConfigSnapshot | null)?.roles);
+        let roleFailure: unknown = null;
+        await Promise.all(
+          [...roleContainers].map(async (containerId) => {
+            try {
+              await withTimeout(
+                runtime.destroy(containerId),
+                roleTimeoutMs,
+                `Role container ${containerId} removal timed out after ${roleTimeoutMs}ms`,
+              );
+            } catch (err) {
+              observeCaughtError(err, "platform/engine/modules/deployments/rollback/rollback-orchestrator");
+              roleFailure ??= err;
+            }
+          }),
+        );
+        // Keep the release's retry marker until every unprotected role is gone.
+        if (roleFailure) throw roleFailure;
         const ref = toRef(dep);
         const container = usableRef(ref.containerId);
         const image = usableRef(ref.imageRef);
@@ -578,18 +612,19 @@ async function pruneUnlocked(project: Project): Promise<{ purged: number; failed
               });
             }
           } catch (err) {
+            observeCaughtError(err, "platform/engine/modules/deployments/rollback/rollback-orchestrator");
             serviceFailure ??= err;
           }
         }
         if (serviceFailure) throw serviceFailure;
       } finally {
-        await runtime.dispose?.();
+        if (!runtimeOverride) await runtime.dispose?.();
       }
       await repos.deployment.setArtifactRetainedAt(dep.id, null);
       purged += 1;
     } catch (err) {
       failed += 1;
-      console.error(`[rollback-orchestrator] Failed to purge ${dep.id}:`, err);
+      errorDiagnostics.error("platform/engine/modules/deployments/rollback/rollback-orchestrator", `[rollback-orchestrator] Failed to purge ${dep.id}:`, err);
     }
   }
   if (purged > 0) console.log(`[rollback-orchestrator] project ${project.id}: reclaimed artifacts for ${purged} past release(s)`);
@@ -605,7 +640,44 @@ export async function reconcileProjectRetention(projectId: string) {
     // remove more of that release while its cleanup is incomplete.
     if (result.failed) return { purged: result.purged, removed: 0, bytes: 0, skippedInUse: 0, errors: result.failed };
     const { reapProjectImages } = await import("../image-gc");
-    return { ...await reapProjectImages(project), purged: result.purged };
+    const reaped = await reapProjectImages(project);
+    if (reaped.errors || project.rollbackWindow != null || !project.activeDeploymentId)
+      return { ...reaped, purged: result.purged };
+    const active = await findActiveDeployment(project);
+    if (!active) return { ...reaped, purged: result.purged };
+    const destination = await resolveDeploymentRuntimeForRead(active);
+    const { runtime, hostPortTarget } = destination;
+    try {
+      // This policy measures Docker storage only. Durable units and unknown
+      // destinations keep their existing retention behavior.
+      if (!(runtime instanceof DockerRuntime) || !hostPortTarget?.stable) return { ...reaped, purged: result.purged };
+      const serverId = destination.serverId ?? undefined;
+      // A socket runtime may not retain an executor. Its disk is on this host,
+      // never an implicit/repurposed org server selected by an alias lookup.
+      const executor = runtime.connectionOptions?.executor ??
+        (hostPortTarget.targetKey === LOCAL_HOST_PORT_TARGET.targetKey ? await acquireLocalHostExecutor() : null);
+      if (!executor) return { ...reaped, purged: result.purged };
+      const automatic = await reclaimAutomaticRollbackArtifacts(project, {
+        readDisk: () => getHostDisk(serverId, project.organizationId, { refresh: true, executor }),
+        load: () => retainedArtifacts(project),
+        ownedImages: async () => new Set((await runtime.listProjectImages(project.id)).flatMap(image => image.repoTags.filter(ownsBuiltImage))),
+        purge: async (inventory) => {
+          const historical = await resolveDeploymentRuntimeForRead(inventory.overflow[0]!);
+          try {
+            if (!(historical.runtime instanceof DockerRuntime) || historical.hostPortTarget?.stable !== true ||
+                historical.hostPortTarget.targetKey !== hostPortTarget.targetKey) return { purged: 0, failed: 0 };
+            // Use this exact verified connection for removal, not a second
+            // resolution through a server alias that an operator can repoint.
+            return await pruneUnlocked(project, inventory, historical.runtime);
+          } finally {
+            await historical.runtime.dispose?.();
+          }
+        },
+      });
+      return { ...reaped, purged: result.purged + automatic.purged, errors: reaped.errors + automatic.failed };
+    } finally {
+      await runtime.dispose?.();
+    }
   }) ?? { purged: 0, removed: 0, bytes: 0, skippedInUse: 0, errors: 0 };
 }
 
@@ -613,7 +685,7 @@ export async function reconcileProjectRetentionSafe(projectId: string): Promise<
   try {
     await reconcileProjectRetention(projectId);
   } catch (err) {
-    console.error(`[rollback-orchestrator] Cleanup deferred for ${projectId}:`, err);
+    errorDiagnostics.error("platform/engine/modules/deployments/rollback/rollback-orchestrator", `[rollback-orchestrator] Cleanup deferred for ${projectId}:`, err);
   }
 }
 

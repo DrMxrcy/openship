@@ -1,4 +1,4 @@
-import { formatCpuCores, formatMemoryMb, planServiceResources } from "@repo/core";
+import { formatMemoryMb } from "@repo/core";
 import { Navbar, Footer } from "@/components/landing";
 import {
   STANDARD,
@@ -7,9 +7,12 @@ import {
   cloudFrom,
   priceParts,
   getCloudPricing,
+  money,
   type PricedPlan,
 } from "@/lib/pricing";
 import { CLOUD_CTA_HREF, SELF_HOST_CTA_HREF, faq } from "./_data";
+import { PricingProducts } from "./PricingProducts";
+import { cloudPlanHref, managePlanHref } from "@/lib/cloud-links";
 
 // Match the public catalog and JSON-LD cache window.
 export const revalidate = 60;
@@ -39,52 +42,47 @@ const count = (value: number | null) =>
 
 function PlanResources({ plan }: { plan: PricedPlan }) {
   const pool = plan.resourceLimits;
-  const service = planServiceResources(plan.limits);
   const hasPool =
     pool?.max_total_vcpus != null &&
     pool.max_total_ram_mb != null &&
     pool.max_total_disk_gb != null;
 
+  // Show finite allowances that distinguish the plans alongside shared capacity.
+  const facts = [
+    ...(plan.limits.maxProjects != null ? [{ label: "Projects & apps", value: count(plan.limits.maxProjects) }] : []),
+    ...(plan.limits.runningServices != null ? [{ label: "Running services", value: count(plan.limits.runningServices) }] : []),
+    ...(plan.limits.concurrentBuilds != null ? [{ label: "Concurrent builds", value: count(plan.limits.concurrentBuilds) }] : []),
+    ...(plan.limits.buildMinutesPerMonth !== null
+      ? [{ label: "Build time", value: `${count(plan.limits.buildMinutesPerMonth)} min/mo` }]
+      : plan.billingMode !== "monthly" ? [{ label: "Build time", value: "Metered" }] : []),
+  ];
+
   return (
-    <dl className="pp-plan-resources">
-      <div className="pp-plan-resource">
-        <dt>Managed server capacity</dt>
-        <dd>
-          {hasPool ? (
-            <>
-              {formatCpuCores(pool.max_total_vcpus!)} · {formatMemoryMb(pool.max_total_ram_mb!)} RAM
-              <span>{pool.max_total_disk_gb!.toLocaleString("en")} GB disk</span>
-            </>
-          ) : (
-            "See dashboard"
-          )}
-        </dd>
-      </div>
-      <div className="pp-plan-resource">
-        <dt>Per service, up to</dt>
-        <dd>
-          {service
-            ? `${formatCpuCores(service.cpuCores)} · ${formatMemoryMb(service.memoryMb)} RAM`
-            : "Custom limits"}
-        </dd>
-      </div>
-      <div className="pp-plan-limit">
-        <dt>Projects</dt>
-        <dd>{count(plan.limits.maxProjects)}</dd>
-      </div>
-      <div className="pp-plan-limit">
-        <dt>Running services</dt>
-        <dd>{count(plan.limits.runningServices)}</dd>
-      </div>
-      <div className="pp-plan-limit">
-        <dt>Build time</dt>
-        <dd>
-          {plan.limits.buildMinutesPerMonth === null
-            ? plan.billingMode === "monthly" ? "No time cap" : "Metered"
-            : `${count(plan.limits.buildMinutesPerMonth)} min/mo`}
-        </dd>
-      </div>
-    </dl>
+    <div className="pp-plan-resources">
+      {hasPool ? (
+        <dl className="pp-plan-capacity" aria-label="Managed server capacity">
+          {[
+            { label: "vCPU", value: pool.max_total_vcpus!.toLocaleString("en") },
+            { label: "RAM", value: formatMemoryMb(pool.max_total_ram_mb!) },
+            { label: "Storage", value: `${pool.max_total_disk_gb!.toLocaleString("en")} GB` },
+          ].map(({ label, value }) => (
+            <div key={label}>
+              <dt>{label}</dt>
+              <dd>{value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : <p className="pp-plan-capacity-fallback">See dashboard for server capacity</p>}
+      {facts.length > 0 && (
+        <dl className="pp-plan-limits">
+          {facts.map(({ label, value }) => (
+            <div className="pp-plan-limit" key={label}>
+              <dt>{label}</dt><dd>{value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
   );
 }
 
@@ -99,7 +97,7 @@ export default async function PricingPage() {
         <section className="pp-hero">
           <div className="pp-hero-glow" aria-hidden="true" />
           <div className="pp-container pp-hero-inner">
-            <p className="pp-eyebrow">Openship Cloud</p>
+            <p className="pp-eyebrow">Openship pricing</p>
             <h1 className="pp-headline">
               Start small. <span>Grow from here.</span>
             </h1>
@@ -133,6 +131,7 @@ export default async function PricingPage() {
               <p>Monthly billing · Cancel anytime</p>
             </header>
 
+            <PricingProducts cloud={<>
             {!pricing.available ? (
               <div className="pp-unavailable" role="status">
                 <h3>We couldn’t load the current plans.</h3>
@@ -161,7 +160,7 @@ export default async function PricingPage() {
                       </div>
                       <p className="pp-plan-credits">
                         {plan.billingMode === "monthly" ? (
-                          "CPU, RAM and disk covered all month"
+                          "One Cloud Space, billed monthly"
                         ) : plan.monthlyCredits === null ? (
                           "See dashboard for included credits"
                         ) : (
@@ -171,16 +170,16 @@ export default async function PricingPage() {
                           </>
                         )}
                       </p>
-                      <a
-                        href={CLOUD_CTA_HREF}
-                        className={`pp-plan-cta ${plan.popular ? "pp-plan-cta--filled" : ""}`}
-                      >
-                        {chooseLabel(plan.name)}
-                      </a>
                       <PlanResources plan={plan} />
                       <p className="pp-plan-support">
                         {supportLabels[plan.support] ?? "See support options"}
                       </p>
+                      <a
+                        href={cloudPlanHref(plan.id)}
+                        className={`pp-plan-cta ${plan.popular ? "pp-plan-cta--filled" : ""}`}
+                      >
+                        {chooseLabel(plan.name)}
+                      </a>
                     </article>
                   );
                 })}
@@ -192,13 +191,18 @@ export default async function PricingPage() {
                 <div className="pp-usage-note" id="usage">
                   <p>
                     {pricing.tiers.every(plan => plan.billingMode === "monthly")
-                      ? "Each plan includes one managed server, with CPU, RAM and storage covered for the paid month. Apps and builds share its capacity. Managed proxy transfer and backups are separate."
-                      : "Apps and builds share your server’s capacity. Review the billing mode and included allowance before checkout."}
+                      ? "Each plan includes one Cloud Space, with CPU, RAM and storage covered for the paid month. Apps and builds share its capacity. Managed proxy transfer and backups are separate."
+                      : "Apps and builds share your Cloud Space’s capacity. Review the billing mode and included allowance before checkout."}
                   </p>
                   <a href="/docs/guides/billing">
                     How billing works <span aria-hidden="true">↗</span>
                   </a>
                 </div>
+                {pricing.management?.includedWithCloud && <p className="pp-email-note">Paid Cloud Spaces also include management for {pricing.management.includedServers} customer-owned servers per workspace. Additional servers cost {money(pricing.management.extraServerMonthlyCents)} each per month.</p>}
+                <p className="pp-email-note">
+                  <strong>Managed email · Coming soon.</strong> Cloud server plans host applications;
+                  they do not provision a mail server. Self-hosted email remains available on your own server.
+                </p>
                 <div className="pp-standard">
                   <h3>{STANDARD.title}</h3>
                   <ul>
@@ -213,6 +217,36 @@ export default async function PricingPage() {
               </>
             )}
 
+            </>} infrastructure={
+              <div className="pp-plans">
+                <article className="pp-plan pp-plan--highlight">
+                  <h3 className="pp-plan-name">Openship Manage</h3>
+                  <p className="pp-plan-lead">Your servers. Our hosted control plane.</p>
+                  {pricing.management ? <>
+                    <div className="pp-plan-price"><span className="pp-plan-amt">{money(pricing.management.monthlyCents)}</span><span className="pp-plan-per">/ month per workspace</span></div>
+                    <p className="pp-plan-credits">Includes {pricing.management.includedServers} customer-owned servers. {money(pricing.management.extraServerMonthlyCents)} / month for each additional server.</p>
+                    <p className="pp-plan-lead">Deployments, domains, logs, monitoring, backups, API, SDK and CLI access. Compute and storage are provided by you.</p>
+                    <p className="pp-plan-support">Email support for the Openship platform</p>
+                    <a className="pp-plan-cta pp-plan-cta--filled" href={managePlanHref()}>Choose Manage</a>
+                  </> : <p className="pp-plan-lead">View current management pricing in the dashboard.</p>}
+                </article>
+                <article className="pp-plan">
+                  <h3 className="pp-plan-name">Self-hosted</h3>
+                  <p className="pp-plan-lead">Run the control plane on your infrastructure.</p>
+                  <div className="pp-plan-price"><span className="pp-plan-amt">Free</span></div>
+                  <p className="pp-plan-lead">The full open-source platform. You operate the control plane, servers, updates and backups.</p>
+                  <p className="pp-plan-support">Community support</p>
+                  <a className="pp-plan-cta" href={SELF_HOST_CTA_HREF}>Start self-hosting</a>
+                </article>
+                <article className="pp-plan">
+                  <h3 className="pp-plan-name">Dedicated</h3>
+                  <p className="pp-plan-lead">Physical hardware with managed deployment and support.</p>
+                  <div className="pp-plan-price"><span className="pp-plan-amt">Custom</span></div>
+                  <p className="pp-plan-lead">Hardware, region, capacity and support terms are confirmed in your quote before purchase.</p>
+                  <a className="pp-plan-cta" href={pricing.management ? `mailto:${pricing.management.dedicatedContact}?subject=Dedicated%20Openship%20hosting` : "/support"}>Request a quote</a>
+                </article>
+              </div>
+            } />
             <div className="pp-options">
               {pricing.customTiers.map((plan) => (
                 <div className="pp-option" key={plan.id}>

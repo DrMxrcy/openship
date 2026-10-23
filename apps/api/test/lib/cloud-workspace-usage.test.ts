@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => ({
   exec: vi.fn(),
   inventory: vi.fn(),
+  info: vi.fn(),
   dispose: vi.fn(),
   allocation: vi.fn(),
   owner: vi.fn(),
@@ -35,7 +36,7 @@ vi.mock("@repo/adapters", async (original) => ({
   CloudDockerRuntime: {
     forWorkspace: async () => ({
       executor: { exec: h.exec },
-      docker: { df: h.inventory },
+      docker: { df: h.inventory, info: h.info },
       dispose: h.dispose,
     }),
   },
@@ -63,6 +64,7 @@ const sample = {
 };
 beforeEach(() => {
   vi.resetAllMocks();
+  h.info.mockResolvedValue({ Driver: "overlay2" });
   h.owner.mockResolvedValue({
     id: "cws-test",
     organizationId: "org-test",
@@ -102,6 +104,21 @@ beforeEach(() => {
 });
 
 describe("measured subscription workspace resources", () => {
+  it("keeps monitoring on fuse-overlayfs independent of expensive Docker layer scans", async () => {
+    h.info.mockResolvedValue({ Driver: "fuse-overlayfs" });
+    const usage = await measureCloudWorkspace("org-test", "cws-test", true);
+    expect(usage).toMatchObject({
+      available: true,
+      memoryUsedMb: 2048,
+      memoryAvailableMb: 6144,
+      diskUsedMb: 2048,
+      sharedDiskMb: null,
+    });
+    expect(usage.projects.map((p) => p.diskMb)).toEqual([null, null]);
+    expect(h.inventory).not.toHaveBeenCalled();
+    expect(h.exec).toHaveBeenCalledOnce();
+    expect(h.dispose).toHaveBeenCalledOnce();
+  });
   it("checks the pinned Cloud connection before serving a cached linked-server measurement", async () => {
     await measureCloudWorkspace("org-test", "cws-test", true);
     h.owner.mockResolvedValue({ id: "cws-test", organizationId: "org-test", remote: { userId: "old-owner" }, linkedProjects: [] });
@@ -155,14 +172,21 @@ describe("measured subscription workspace resources", () => {
     );
     expect(h.dispose).toHaveBeenCalledOnce();
   });
+  it("reads verified allocation without sampling usage for an uncapped build", async () => {
+    const result = await sampleCloudWorkspaceResources("org-test", "cws-test", false);
+    expect(result.capacity).toEqual(capacity);
+    expect(h.exec).not.toHaveBeenCalled();
+    expect(h.dispose).not.toHaveBeenCalled();
+    expect(workspaceBuildResources(result.capacity, result.usage)).toMatchObject({ cpuCores: 0, memoryMb: 0 });
+  });
   it("uses a cheap host sample for build admission without scanning filesystem data", async () => {
     const result = await sampleCloudWorkspaceResources("org-test", "cws-test");
     expect(result.capacity).toEqual(capacity);
     expect(h.inventory).not.toHaveBeenCalled();
     expect(h.projects).not.toHaveBeenCalled();
     expect(workspaceBuildResources(result.capacity, result.usage)).toEqual({
-      cpuCores: 3,
-      memoryMb: 5734,
+      cpuCores: 0,
+      memoryMb: 0,
       diskMb: 102400,
     });
   });
@@ -175,22 +199,23 @@ describe("builds inside the subscribed host", () => {
     memoryAvailableMb: 6144,
     cpuPercent: 25,
   };
-  it("honors a smaller explicit build cap and bounds stale available memory to the host", () => {
+  it("preserves explicit build allocations and refuses those that cannot fit", () => {
     expect(workspaceBuildResources(capacity, usage, { cpuCores: 0.25, memoryMb: 256 })).toEqual({
       cpuCores: 0.25,
       memoryMb: 256,
       diskMb: capacity.diskMb,
     });
-    expect(
-      workspaceBuildResources(capacity, { ...usage, memoryAvailableMb: 99999 }, { memoryMb: 99999 })
-        .memoryMb,
-    ).toBe(7782);
+    expect(() => workspaceBuildResources(capacity, { ...usage, memoryAvailableMb: 99999 }, { memoryMb: 99999 }))
+      .toThrow("requested build allocation cannot fit");
+    expect(workspaceBuildResources(capacity, { ...usage, memoryAvailableMb: 99999 }).memoryMb).toBe(0);
+    expect(() => workspaceBuildResources(capacity, { ...usage, cpuPercent: 99 }, { cpuCores: 2, memoryMb: 1024 }))
+      .toThrow("requested build allocation cannot fit");
   });
   it("blocks unknown or insufficient free memory before starting a build", () => {
-    expect(() => workspaceBuildResources(capacity, { ...usage, available: false })).toThrow(
+    expect(() => workspaceBuildResources(capacity, { ...usage, available: false }, { cpuCores: 1, memoryMb: 128 })).toThrow(
       "Couldn't measure",
     );
-    expect(() => workspaceBuildResources(capacity, { ...usage, memoryAvailableMb: 500 })).toThrow(
+    expect(() => workspaceBuildResources(capacity, { ...usage, memoryAvailableMb: 500 }, { cpuCores: 1, memoryMb: 128 })).toThrow(
       "too little free memory",
     );
   });

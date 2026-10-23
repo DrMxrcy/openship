@@ -3,6 +3,7 @@ import { matchesWorkspace } from "@/lib/server-reference";
 
 import { useId, useState } from "react";
 import Link from "next/link";
+import { CloudDeployPlanModal } from "@/components/billing/CloudDeployPlanModal";
 import { useDialogFocus } from "@/hooks/useDialogFocus";
 import { useI18n } from "@/components/i18n-provider";
 import { Button } from "@/components/ui/button";
@@ -14,11 +15,14 @@ export function ServerCapacityRecovery({
   message,
   onClose,
   onRetry,
+  advisory = false,
 }: {
   workspaceId?: string;
   message?: string;
   onClose: () => void;
   onRetry?: () => Promise<unknown>;
+  /** Capacity comparison is optional; no plan refusal was received. */
+  advisory?: boolean;
 }) {
   const { t } = useI18n();
   const copy = t.billing.workspaces;
@@ -28,6 +32,7 @@ export function ServerCapacityRecovery({
   const server = data?.servers.find((row) => workspaceId ? matchesWorkspace(row, workspaceId) : data.servers.length === 1 && !!row.managed);
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const [upgrading, setUpgrading] = useState(false);
   async function retry() {
     if (!onRetry || retrying) return;
     setRetrying(true);
@@ -40,6 +45,7 @@ export function ServerCapacityRecovery({
       setRetrying(false);
     }
   }
+  if (upgrading) return <CloudDeployPlanModal workspaceId={workspaceId} restriction={{ code: "PLAN_UPGRADE_REQUIRED", reason: "workspace-capacity", message }} onClose={() => setUpgrading(false)} onRetry={onRetry} />;
   return (
     <div
       ref={dialog}
@@ -51,10 +57,10 @@ export function ServerCapacityRecovery({
       className="space-y-5 p-5 outline-none"
     >
       <h2 id={title} className="text-lg font-semibold">
-        {copy.buildCapacityTitle}
+        {advisory ? t.deployments.resourceGuidance.reviewTitle : copy.buildCapacityTitle}
       </h2>
       {message && <p className="text-sm">{message}</p>}
-      <p className="text-sm text-muted-foreground">{copy.buildCapacityHint}</p>
+      <p className="text-sm text-muted-foreground">{advisory ? t.deployments.resourceGuidance.reviewHint : copy.buildCapacityHint}</p>
       {(error || fetchError) && (
         <p role="alert" className="text-sm text-danger">
           {error || fetchError}
@@ -66,6 +72,7 @@ export function ServerCapacityRecovery({
         </p>
       )}
       <div className="flex flex-wrap gap-2">
+        {workspaceId && <Button onClick={() => setUpgrading(true)}>{t.billing.pricing.upgrade}</Button>}
         {server && (
           <Button asChild>
             <Link
